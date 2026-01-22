@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, status, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 import uuid
@@ -7,12 +8,15 @@ from typing import Optional
 from app.config import get_settings
 from app.db.connection import get_db, engine
 from app.models.database import Base
+from app.auth.models import User as AuthUser, APIKey
 from app.models.schemas import (
     UploadDocumentResponse, ChatEditRequest, ChatEditResponse,
     ConfirmRequest, ConfirmResponse
 )
 from app.services.splitter import BlockSplitter
 from app.models import database as db_models
+from app.auth.dependencies import get_current_active_user, get_optional_user
+from app.auth.router import router as auth_router
 
 settings = get_settings()
 
@@ -22,7 +26,7 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title=settings.APP_NAME,
     version="1.0.0",
-    description="AI-powered document editing system"
+    description="AI-powered document editing system with authentication"
 )
 
 # CORS 配置
@@ -33,6 +37,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 注册认证路由
+app.include_router(auth_router)
 
 
 @app.get("/")
@@ -54,11 +61,12 @@ async def upload_document(
     title: str = Form(...),
     file: Optional[UploadFile] = File(None),
     content: Optional[str] = Form(None),
+    current_user: AuthUser = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """上传文档"""
-    # 模拟用户 ID（实际应该从认证中获取）
-    user_id = uuid.uuid4()
+    """上传文档（需要认证）"""
+    # 使用当前用户的 ID
+    user_id = current_user.user_id
     
     # 获取文档内容
     if file:
