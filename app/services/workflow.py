@@ -7,6 +7,7 @@ from app.nodes.preview import PreviewGeneratorNode
 from app.nodes.apply import ApplyEditsNode
 from app.services.retriever import HybridRetriever
 from app.models.schemas import ChatEditResponse, CandidateResponse
+from app.models import database as db_models
 import uuid
 
 
@@ -40,7 +41,26 @@ class EditWorkflow:
         user_message: str,
         user_selection: Optional[str] = None
     ) -> ChatEditResponse:
-        """执行编辑工作流"""
+        """执行编辑工作流（集成 Langfuse 追踪）"""
+        
+        # 创建 Langfuse Trace
+        trace = None
+        trace_id = None
+        try:
+            from app.services.langfuse_client import create_trace
+            trace = create_trace(
+                name="document_edit_workflow",
+                user_id=user_id,
+                session_id=session_id,
+                metadata={
+                    "doc_id": doc_id,
+                    "message": user_message
+                }
+            )
+            if trace:
+                trace_id = trace.id
+        except Exception as e:
+            print(f"Langfuse trace 创建失败: {e}")
         
         # 获取 active_revision
         active_rev = self.db.query(
@@ -66,7 +86,8 @@ class EditWorkflow:
             "user_message": user_message,
             "user_selection": user_selection,
             "retry_count": 0,
-            "max_retries": 2
+            "max_retries": 2,
+            "trace_id": trace_id  # 传递 trace_id
         }
         
         try:
@@ -77,13 +98,20 @@ class EditWorkflow:
             
             # 2. 检索候选
             intent = state["intent"]
-            candidates = self.retriever.search(
-                query=user_message,
-                doc_id=doc_id,
-                rev_id=state["active_rev_id"],
-                scope_hint=intent.scope_hint,
-                top_k=10
-            )
+            try:
+                candidates = self.retriever.search(
+                    query=user_message,
+                    doc_id=doc_id,
+                    rev_id=state["active_rev_id"],
+                    scope_hint=intent.scope_hint,
+                    top_k=10
+                )
+            except Exception as e:
+                # 如果检索失败，回滚事务并重试
+                print(f"检索失败: {e}")
+                self.db.rollback()
+                candidates = []
+            
             state["candidates"] = candidates
             
             if not candidates:
@@ -156,11 +184,29 @@ class EditWorkflow:
             )
             
         except Exception as e:
+            # 记录错误到 Langfuse
+            if trace:
+                try:
+                    trace.update(
+                        output={"error": str(e)},
+                        level="ERROR"
+                    )
+                except:
+                    pass
+            
             return ChatEditResponse(
                 status="failed",
                 message=f"处理失败: {str(e)}",
                 error={"code": "workflow_error", "message": str(e)}
             )
+        finally:
+            # 刷新 Langfuse 缓冲区
+            if trace:
+                try:
+                    from app.services.langfuse_client import flush
+                    flush()
+                except:
+                    pass
     
     def _handle_error(self, state: Dict[str, Any]) -> ChatEditResponse:
         """处理错误"""
@@ -187,15 +233,10 @@ class EditWorkflow:
     
     def _export_document(self, rev_id: str) -> str:
         """导出文档"""
-        from app.models import database as db_models
-        
         blocks = self.db.query(db_models.BlockVersion).filter(
             db_models.BlockVersion.rev_id == uuid.UUID(rev_id)
         ).order_by(db_models.BlockVersion.order_index).all()
         
         markdown_parts = [block.content_md for block in blocks]
         return '\n\n'.join(markdown_parts)
-
-
-# 导入数据库模型
 from app.models import database as db_models

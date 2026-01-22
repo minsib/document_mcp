@@ -52,8 +52,16 @@ class IntentParserNode:
             {"role": "user", "content": f"用户消息：{user_message}\n\n输出 JSON："}
         ]
         
+        # 获取 trace_id
+        trace_id = state.get("trace_id")
+        
         try:
-            response = self.llm.chat_completion_json(messages, temperature=0.3)
+            response = self.llm.chat_completion_json(
+                messages, 
+                temperature=0.3,
+                trace_id=trace_id,
+                span_name="intent_parser"
+            )
             intent_data = json.loads(response)
             
             # 构建 Intent 对象

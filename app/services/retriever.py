@@ -102,66 +102,79 @@ class HybridRetriever:
         top_k: int
     ) -> List[BlockCandidate]:
         """向量相似度搜索"""
-        # 生成查询向量
-        query_embedding = self.embedding_service.generate_embedding(query)
-        
-        # 构建 SQL 查询
-        rev_uuid = uuid.UUID(rev_id)
-        
-        # 使用余弦距离搜索
-        sql = text("""
-            SELECT 
-                bv.block_id,
-                bv.plain_text,
-                bv.order_index,
-                bv.block_type,
-                bv.embedding <=> :embedding::vector AS distance
-            FROM block_versions bv
-            WHERE bv.rev_id = :rev_id
-                AND bv.embedding IS NOT NULL
-            ORDER BY distance
-            LIMIT :limit
-        """)
-        
-        results = self.db.execute(
-            sql,
-            {
-                'embedding': str(query_embedding),
-                'rev_id': rev_uuid,
-                'limit': top_k
-            }
-        ).fetchall()
-        
-        # 转换为 BlockCandidate
-        candidates = []
-        for row in results:
-            # 距离转换为分数（0-1）
-            score = 1.0 / (1.0 + row.distance)
+        try:
+            # 生成查询向量
+            query_embedding = self.embedding_service.generate_embedding(query)
             
-            # 获取父级标题
-            parent_heading = self._get_parent_heading_by_id(str(row.block_id), rev_id)
+            # 构建 SQL 查询
+            rev_uuid = uuid.UUID(rev_id)
             
-            # 应用 scope_hint 加权
-            if scope_hint:
-                if scope_hint.heading and parent_heading:
-                    if scope_hint.heading.lower() in parent_heading.lower():
-                        score += 0.3
+            # 将向量转换为字符串格式
+            embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
+            
+            # 使用余弦距离搜索 - 使用 bindparam 正确绑定参数
+            from sqlalchemy import bindparam
+            sql = text("""
+                SELECT 
+                    bv.block_id,
+                    bv.plain_text,
+                    bv.order_index,
+                    bv.block_type,
+                    bv.embedding <=> :embedding::vector AS distance
+                FROM block_versions bv
+                WHERE bv.rev_id = :rev_id::uuid
+                    AND bv.embedding IS NOT NULL
+                ORDER BY distance
+                LIMIT :limit
+            """).bindparams(
+                bindparam('embedding', type_=text),
+                bindparam('rev_id', type_=text),
+                bindparam('limit', type_=text)
+            )
+            
+            results = self.db.execute(
+                sql,
+                {
+                    'embedding': embedding_str,
+                    'rev_id': str(rev_uuid),
+                    'limit': str(top_k)
+                }
+            ).fetchall()
+            
+            # 转换为 BlockCandidate
+            candidates = []
+            for row in results:
+                # 距离转换为分数（0-1）
+                score = 1.0 / (1.0 + row.distance)
                 
-                if scope_hint.keywords:
-                    for keyword in scope_hint.keywords:
-                        if normalize_text(keyword) in normalize_text(row.plain_text):
-                            score += 0.2
+                # 获取父级标题
+                parent_heading = self._get_parent_heading_by_id(str(row.block_id), rev_id)
+                
+                # 应用 scope_hint 加权
+                if scope_hint:
+                    if scope_hint.heading and parent_heading:
+                        if scope_hint.heading.lower() in parent_heading.lower():
+                            score += 0.3
+                    
+                    if scope_hint.keywords:
+                        for keyword in scope_hint.keywords:
+                            if normalize_text(keyword) in normalize_text(row.plain_text):
+                                score += 0.2
+                
+                candidates.append(BlockCandidate(
+                    block_id=str(row.block_id),
+                    snippet=row.plain_text[:200] if row.plain_text else '',
+                    heading_context=parent_heading or "（无标题）",
+                    order_index=row.order_index,
+                    score=min(score, 1.0),
+                    block_type=row.block_type
+                ))
             
-            candidates.append(BlockCandidate(
-                block_id=str(row.block_id),
-                snippet=row.plain_text[:200] if row.plain_text else '',
-                heading_context=parent_heading or "（无标题）",
-                order_index=row.order_index,
-                score=min(score, 1.0),
-                block_type=row.block_type
-            ))
-        
-        return candidates
+            return candidates
+            
+        except Exception as e:
+            print(f"向量检索失败: {e}")
+            return []
     
     def _reciprocal_rank_fusion(
         self,

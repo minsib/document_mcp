@@ -35,8 +35,11 @@ class EmbeddingService:
             # 返回零向量作为降级
             return [0.0] * 1536
     
-    def generate_embeddings_batch(self, texts: List[str], batch_size: int = 50) -> List[List[float]]:
-        """批量生成 embeddings"""
+    def generate_embeddings_batch(self, texts: List[str], batch_size: int = 10) -> List[List[float]]:
+        """批量生成 embeddings（Qwen API 限制每批最多 10 个）"""
+        # 确保 batch_size 不超过 10
+        batch_size = min(batch_size, 10)
+        
         embeddings = []
         
         for i in range(0, len(texts), batch_size):

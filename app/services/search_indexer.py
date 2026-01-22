@@ -118,21 +118,25 @@ class MeilisearchIndexer:
                 
                 # 批量更新数据库
                 for block_version_id, embedding in zip(block_version_ids, embeddings):
+                    # 将向量转换为字符串格式
+                    embedding_str = '[' + ','.join(map(str, embedding)) + ']'
                     db.execute(
                         text("""
                             UPDATE block_versions 
                             SET embedding = :embedding::vector
-                            WHERE block_version_id = :block_version_id
+                            WHERE block_version_id = :block_version_id::uuid
                         """),
                         {
-                            'embedding': str(embedding),
-                            'block_version_id': block_version_id
+                            'embedding': embedding_str,
+                            'block_version_id': str(block_version_id)
                         }
                     )
                 db.commit()
                 print(f"✅ 成功生成并存储 {len(embeddings)} 个 embeddings")
             except Exception as e:
                 print(f"⚠️ Embedding 生成失败（不影响主流程）: {e}")
+                # 回滚失败的事务
+                db.rollback()
                 # 不抛出异常，允许继续
     
     def update_index_for_new_revision(
