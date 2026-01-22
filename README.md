@@ -61,6 +61,15 @@
 - PostgreSQL 15+ (with pgvector extension)
 - Redis 7+
 - Meilisearch 1.5+
+- **Qwen API Key**（必需）
+
+### 获取 Qwen API Key
+
+1. 访问阿里云百炼平台：https://dashscope.console.aliyun.com/
+2. 注册/登录账号
+3. 进入 API-KEY 管理页面：https://dashscope.console.aliyun.com/apiKey
+4. 创建新的 API Key
+5. 复制 API Key 到 `.env` 文件中
 
 ### 安装步骤
 
@@ -489,7 +498,7 @@ A:
 
 - 项目主页：https://github.com/minsib/document_mcp
 - 问题反馈：https://github.com/minsib/document_mcp/issues
-- 邮箱：your-email@example.com
+- 邮箱：minsibour@gmail.com
 
 ## 致谢
 

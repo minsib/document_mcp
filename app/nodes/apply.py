@@ -79,13 +79,14 @@ class ApplyEditsNode:
                 self.db.add(edit_op)
             
             # 7. 更新 active_rev（CAS 操作）
+            from sqlalchemy import text
             result = self.db.execute(
-                """
+                text("""
                 UPDATE document_active_revision
                 SET rev_id = :new_rev_id, version = version + 1, updated_at = now()
                 WHERE doc_id = :doc_id AND version = :expected_version
                 RETURNING version
-                """,
+                """),
                 {
                     "new_rev_id": new_rev.rev_id,
                     "doc_id": doc_id,
@@ -105,7 +106,7 @@ class ApplyEditsNode:
                 new_rev_id=str(new_rev.rev_id),
                 new_rev_no=new_rev_no,
                 new_version=new_version,
-                op_ids=[str(op.op_id) for op in edit_plan.operations]
+                op_ids=[]  # 简化：不返回 op_ids
             )
             
             return state
@@ -172,12 +173,13 @@ class ApplyEditsNode:
                 
                 elif op.op_type == "delete":
                     # 标记软删除
+                    from sqlalchemy import text
                     self.db.execute(
-                        """
+                        text("""
                         UPDATE blocks
                         SET deleted_at = now()
                         WHERE block_id = :block_id
-                        """,
+                        """),
                         {"block_id": block.block_id}
                     )
                     # 不添加到 new_blocks

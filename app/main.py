@@ -358,12 +358,13 @@ async def rollback_revision(
         db.add(new_block_version)
     
     # 更新 active_rev
+    from sqlalchemy import text
     db.execute(
-        """
+        text("""
         UPDATE document_active_revision
         SET rev_id = :new_rev_id, version = version + 1, updated_at = now()
         WHERE doc_id = :doc_id
-        """,
+        """),
         {"new_rev_id": new_rev.rev_id, "doc_id": doc_uuid}
     )
     

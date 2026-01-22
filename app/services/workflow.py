@@ -157,12 +157,26 @@ class EditWorkflow:
     
     def _handle_error(self, state: Dict[str, Any]) -> ChatEditResponse:
         """处理错误"""
-        error = state.get("error", {})
-        return ChatEditResponse(
-            status="failed",
-            message=error.get("message", "处理失败"),
-            error=error
-        )
+        error = state.get("error")
+        if isinstance(error, dict):
+            return ChatEditResponse(
+                status="failed",
+                message=error.get("message", "处理失败"),
+                error=error
+            )
+        elif hasattr(error, 'model_dump'):
+            error_dict = error.model_dump()
+            return ChatEditResponse(
+                status="failed",
+                message=error_dict.get("message", "处理失败"),
+                error=error_dict
+            )
+        else:
+            return ChatEditResponse(
+                status="failed",
+                message=str(error) if error else "处理失败",
+                error={"code": "unknown_error", "message": str(error) if error else "未知错误"}
+            )
     
     def _export_document(self, rev_id: str) -> str:
         """导出文档"""

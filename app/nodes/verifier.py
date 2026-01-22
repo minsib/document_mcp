@@ -81,6 +81,20 @@ class VerifierNode:
     
     def _llm_select(self, intent, candidates: List[BlockCandidate]) -> TargetSelection:
         """使用 LLM 选择目标块"""
+        # 如果候选很少，直接返回
+        if len(candidates) <= 2:
+            if candidates:
+                evidence = self._extract_evidence(candidates[0])
+                return TargetSelection(
+                    targets=[TargetBlock(
+                        block_id=candidates[0].block_id,
+                        evidence=evidence,
+                        confidence=candidates[0].score
+                    )],
+                    need_user_disambiguation=False,
+                    reasoning="候选数量少，直接选择最佳匹配"
+                )
+        
         system_prompt = """你是一个文档定位助手。
 
 关键规则：
@@ -117,10 +131,31 @@ class VerifierNode:
             {"role": "user", "content": f"用户意图：\n{intent.model_dump_json(indent=2)}\n\n候选段落：\n{candidates_text}\n\n输出 JSON："}
         ]
         
-        response = self.llm.chat_completion_json(messages, temperature=0.3)
-        selection_data = json.loads(response)
-        
-        return TargetSelection(**selection_data)
+        try:
+            response = self.llm.chat_completion_json(messages, temperature=0.3)
+            selection_data = json.loads(response)
+            
+            return TargetSelection(**selection_data)
+        except Exception as e:
+            # 降级：返回第一个候选
+            if candidates:
+                evidence = self._extract_evidence(candidates[0])
+                return TargetSelection(
+                    targets=[TargetBlock(
+                        block_id=candidates[0].block_id,
+                        evidence=evidence,
+                        confidence=candidates[0].score
+                    )],
+                    need_user_disambiguation=False,
+                    reasoning=f"LLM 选择失败，使用最佳匹配: {str(e)}"
+                )
+            else:
+                return TargetSelection(
+                    targets=[],
+                    need_user_disambiguation=True,
+                    candidates_for_user=candidates[:5],
+                    reasoning="无法自动选择"
+                )
     
     def _extract_evidence(self, candidate: BlockCandidate) -> EvidenceQuote:
         """从候选中提取证据"""
