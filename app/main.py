@@ -510,3 +510,242 @@ async def rollback_revision(
         new_rev_no=new_rev_no,
         message=f"已回滚到版本 {request.get('target_rev_no', '?')}"
     )
+
+
+@app.post("/v1/chat/bulk-edit")
+async def bulk_edit(
+    request: dict,
+    db: Session = Depends(get_db)
+):
+    """
+    批量修改接口
+    
+    请求格式:
+    {
+        "session_id": "uuid",
+        "doc_id": "uuid",
+        "message": "将所有'旧词'替换为'新词'",
+        "match_type": "exact_term",  // exact_term | regex | semantic
+        "scope_filter": {
+            "term": "旧词",
+            "replacement": "新词",
+            "heading": "可选：限制在某个章节"
+        }
+    }
+    """
+    from app.nodes.bulk_discover import BulkDiscoverNode
+    from app.nodes.bulk_preview import BulkPreviewNode
+    from app.models.schemas import Intent, ScopeHint
+    
+    # 解析请求
+    session_id = request.get("session_id")
+    doc_id = request.get("doc_id")
+    message = request.get("message")
+    match_type = request.get("match_type", "exact_term")
+    scope_filter = request.get("scope_filter", {})
+    
+    if not all([session_id, doc_id, message]):
+        raise HTTPException(400, "缺少必需参数")
+    
+    # 获取当前活跃版本
+    doc_uuid = uuid.UUID(doc_id)
+    active_rev = db.query(db_models.DocumentActiveRevision).filter(
+        db_models.DocumentActiveRevision.doc_id == doc_uuid
+    ).first()
+    
+    if not active_rev:
+        raise HTTPException(404, "文档不存在")
+    
+    # 构建 Intent
+    intent = Intent(
+        operation="multi_replace",
+        scope_hint=ScopeHint(
+            heading=scope_filter.get("heading"),
+            keywords=[scope_filter.get("term", "")],
+            block_type=scope_filter.get("block_type")
+        ),
+        constraints={},
+        risk="medium",
+        match_type=match_type,
+        apply_scope="all_matches",
+        scope_filter=scope_filter
+    )
+    
+    try:
+        # 1. 批量发现
+        discover_node = BulkDiscoverNode(db)
+        candidates = discover_node.discover(
+            intent,
+            doc_id,
+            str(active_rev.rev_id),
+            max_changes=100
+        )
+        
+        if not candidates:
+            return {
+                "status": "no_matches",
+                "message": "未找到匹配的内容",
+                "candidates": []
+            }
+        
+        # 2. 生成预览
+        preview_node = BulkPreviewNode(db)
+        preview = preview_node.generate_preview(
+            intent,
+            candidates,
+            str(active_rev.rev_id)
+        )
+        
+        if not preview.diffs:
+            return {
+                "status": "no_changes",
+                "message": "没有需要修改的内容",
+                "preview": preview.model_dump()
+            }
+        
+        # 3. 生成 confirm_token
+        from app.services.cache import get_cache_manager
+        import hashlib
+        import json
+        import time
+        
+        cache = get_cache_manager()
+        token_id = str(uuid.uuid4())
+        
+        # 计算 preview_hash
+        preview_json = json.dumps(preview.model_dump(), sort_keys=True)
+        preview_hash = hashlib.sha256(preview_json.encode()).hexdigest()
+        
+        payload = {
+            "token_id": token_id,
+            "session_id": session_id,
+            "doc_id": doc_id,
+            "active_rev_id": str(active_rev.rev_id),
+            "active_version": active_rev.version,
+            "preview_hash": preview_hash,
+            "preview": preview.model_dump(),
+            "intent": intent.model_dump(),
+            "created_at": time.time(),
+            "expires_at": time.time() + 900  # 15 分钟
+        }
+        
+        cache.store_confirm_token(session_id, token_id, payload, ttl=900)
+        
+        return {
+            "status": "need_confirm",
+            "message": f"将修改 {preview.total_changes} 处内容，请确认",
+            "preview": preview.model_dump(),
+            "confirm_token": token_id,
+            "preview_hash": preview_hash,
+            "grouped_by_heading": preview.grouped_by_heading
+        }
+        
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"批量修改失败: {str(e)}")
+
+
+@app.post("/v1/chat/bulk-confirm")
+async def bulk_confirm(
+    request: dict,
+    db: Session = Depends(get_db)
+):
+    """
+    确认批量修改
+    
+    请求格式:
+    {
+        "session_id": "uuid",
+        "doc_id": "uuid",
+        "confirm_token": "uuid",
+        "preview_hash": "hash",
+        "action": "apply" | "cancel"
+    }
+    """
+    from app.nodes.bulk_apply import BulkApplyNode
+    from app.services.cache import get_cache_manager
+    from app.models.schemas import PreviewDiff
+    import hashlib
+    import json
+    
+    session_id = request.get("session_id")
+    doc_id = request.get("doc_id")
+    confirm_token = request.get("confirm_token")
+    preview_hash = request.get("preview_hash")
+    action = request.get("action", "apply")
+    
+    if not all([session_id, doc_id, confirm_token, preview_hash]):
+        raise HTTPException(400, "缺少必需参数")
+    
+    # 获取 token payload
+    cache = get_cache_manager()
+    payload = cache.get_confirm_token(session_id, confirm_token)
+    
+    if not payload:
+        raise HTTPException(400, "确认令牌无效或已过期")
+    
+    # 验证 preview_hash
+    if preview_hash != payload.get("preview_hash"):
+        cache.delete_confirm_token(session_id, confirm_token)
+        raise HTTPException(400, "预览内容已变更，请重新确认")
+    
+    # 取消操作
+    if action == "cancel":
+        cache.delete_confirm_token(session_id, confirm_token)
+        return {
+            "status": "cancelled",
+            "message": "已取消批量修改"
+        }
+    
+    # 获取当前活跃版本
+    doc_uuid = uuid.UUID(doc_id)
+    active_rev = db.query(db_models.DocumentActiveRevision).filter(
+        db_models.DocumentActiveRevision.doc_id == doc_uuid
+    ).first()
+    
+    if not active_rev:
+        raise HTTPException(404, "文档不存在")
+    
+    # 验证版本号
+    if active_rev.version != payload.get("active_version"):
+        cache.delete_confirm_token(session_id, confirm_token)
+        raise HTTPException(409, "文档版本已变更，预览已失效")
+    
+    try:
+        # 应用批量修改
+        apply_node = BulkApplyNode(db)
+        preview = PreviewDiff(**payload["preview"])
+        
+        result = apply_node.apply_bulk_changes(
+            preview,
+            doc_id,
+            str(active_rev.rev_id),
+            active_rev.version,
+            user_id=str(uuid.uuid4()),  # 实际应该从认证中获取
+            trace_id=None
+        )
+        
+        # 删除 token
+        cache.delete_confirm_token(session_id, confirm_token)
+        
+        # 重新索引（如果启用了 Meilisearch）
+        try:
+            from app.services.search_indexer import get_indexer
+            indexer = get_indexer()
+            indexer.index_document_blocks(doc_id, result['new_rev_id'], db)
+        except Exception as e:
+            print(f"重新索引失败（不影响主流程）: {e}")
+        
+        return {
+            "status": "applied",
+            "message": f"已成功修改 {result['changes_applied']} 处内容",
+            "new_rev_id": result['new_rev_id'],
+            "new_rev_no": result['new_rev_no'],
+            "new_version": result['new_version'],
+            "changes_applied": result['changes_applied']
+        }
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"应用批量修改失败: {str(e)}")
