@@ -15,7 +15,9 @@
 - 🔍 **预览确认**：修改前预览 diff，确认后执行
 - 🔄 **批量修改**：支持全文统一替换和批量编辑
 - 🔒 **并发安全**：乐观锁机制，防止并发冲突
+- 🔐 **用户认证**：JWT Token + API Key 双重认证
 - 📊 **完整审计**：所有操作可追溯，支持审计查询
+- 📈 **监控告警**：健康检查 + Prometheus 指标
 - ⚡ **智能降级**：多级降级策略确保系统稳定性
 
 ## 技术架构
@@ -117,6 +119,11 @@ QWEN_API_KEY=your_qwen_api_key
 QWEN_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
 QWEN_MODEL=qwen-max-latest  # 或 qwen3-235b
 
+# 安全配置（生产环境必须修改）
+SECRET_KEY=your-secret-key-here  # 使用 python -c "import secrets; print(secrets.token_urlsafe(32))" 生成
+JWT_ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=1440  # 24 小时
+
 # Langfuse 配置（可选）
 LANGFUSE_PUBLIC_KEY=your_public_key
 LANGFUSE_SECRET_KEY=your_secret_key
@@ -138,6 +145,9 @@ psql document_edit -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
 # 运行迁移
 alembic upgrade head
+
+# 创建管理员用户
+python3 scripts/create_admin_user.py
 ```
 
 6. **启动服务**
@@ -158,6 +168,31 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 打开浏览器访问：http://localhost:8000/docs
 
 ## 使用示例
+
+### 0. 用户认证
+
+```bash
+# 注册用户
+curl -X POST "http://localhost:8000/v1/auth/register" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "testuser",
+    "email": "test@example.com",
+    "password": "password123"
+  }'
+
+# 登录获取 Token
+curl -X POST "http://localhost:8000/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "testuser",
+    "password": "password123"
+  }'
+
+# 响应包含 access_token 和 refresh_token
+```
+
+详细说明：[AUTH_GUIDE.md](AUTH_GUIDE.md)
 
 ### 1. 上传文档
 
@@ -431,18 +466,45 @@ gunicorn app.main:app \
 
 - **定位准确率**：> 90%（混合检索 + RRF 融合）
 - **单次编辑延迟**：< 3 秒（P95）
+- **批量修改**：< 5 秒（100 处）
 - **并发支持**：100+ 并发编辑请求
 - **可用性**：99.9% SLA
 
+## 监控与健康检查
+
+系统提供完整的监控和可观测性功能：
+
+```bash
+# 健康检查
+curl http://localhost:8000/health/
+
+# Prometheus 指标
+curl http://localhost:8000/metrics
+
+# Kubernetes liveness probe
+curl http://localhost:8000/health/liveness
+
+# Kubernetes readiness probe
+curl http://localhost:8000/health/readiness
+```
+
+详细说明：[MONITORING_GUIDE.md](MONITORING_GUIDE.md)
+
 ## 监控与告警
 
-访问 Grafana 仪表盘查看系统指标：
+系统提供完整的 Prometheus 指标收集：
 
+- **业务指标**：文档上传、编辑操作、批量修改、检索、认证
+- **性能指标**：请求延迟、LLM 调用、数据库、缓存、搜索
+- **系统指标**：应用信息、活跃用户、文档统计
+- **错误指标**：错误总数和分类
+
+配置 Grafana 仪表盘查看：
 - 编辑请求成功率
-- 定位准确率（需要消歧率）
-- API 延迟分布
+- 定位准确率
+- API 延迟分布（P50/P95/P99）
 - 数据库查询性能
-- LLM 调用统计
+- LLM 调用统计和成本
 
 ## 常见问题
 
@@ -480,6 +542,16 @@ A:
 - confirm_token 包含版本号
 - 冲突时自动重试或提示用户
 
+### Q: 如何配置用户认证？
+
+A:
+1. 生成 SECRET_KEY：`python -c "import secrets; print(secrets.token_urlsafe(32))"`
+2. 在 `.env` 文件中设置 SECRET_KEY
+3. 运行 `python3 scripts/create_admin_user.py` 创建管理员
+4. 支持 JWT Token 和 API Key 两种认证方式
+
+详见 [AUTH_GUIDE.md](AUTH_GUIDE.md)
+
 ## 路线图
 
 ### Phase 1: MVP（已完成）
@@ -488,16 +560,18 @@ A:
 - ✅ 版本管理
 - ✅ 预览确认
 
-### Phase 2: 体验优化（进行中）
-- 🚧 混合检索（BM25 + 向量）
-- 🚧 批量修改
+### Phase 2: 体验优化（已完成）
+- ✅ 混合检索（BM25 + 向量）
+- ✅ 批量修改
+- ✅ 用户认证系统
+- ✅ 基础监控
 - 🚧 多轮对话上下文
 - 🚧 用户反馈学习
 
-### Phase 3: 性能优化（计划中）
+### Phase 3: 性能优化（部分完成）
+- ✅ 多级缓存
+- ✅ 增量索引
 - ⏳ Block Version 引用模式
-- ⏳ 多级缓存
-- ⏳ 增量索引
 - ⏳ 分布式部署
 
 ### Phase 4: 高级功能（未来）
