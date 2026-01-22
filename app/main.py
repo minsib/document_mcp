@@ -2,8 +2,10 @@ from fastapi import FastAPI, Depends, HTTPException, status, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from prometheus_client import make_asgi_app
 import uuid
 from typing import Optional
+import logging
 
 from app.config import get_settings
 from app.db.connection import get_db, engine
@@ -17,6 +19,16 @@ from app.services.splitter import BlockSplitter
 from app.models import database as db_models
 from app.auth.dependencies import get_current_active_user, get_optional_user
 from app.auth.router import router as auth_router
+from app.monitoring.health import router as health_router
+from app.monitoring.middleware import MetricsMiddleware, LoggingMiddleware
+from app.monitoring.metrics import app_info
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -26,7 +38,7 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title=settings.APP_NAME,
     version="1.0.0",
-    description="AI-powered document editing system with authentication"
+    description="AI-powered document editing system with authentication and monitoring"
 )
 
 # CORS 配置
@@ -38,8 +50,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 注册认证路由
+# 添加监控中间件
+app.add_middleware(MetricsMiddleware)
+app.add_middleware(LoggingMiddleware)
+
+# 注册路由
 app.include_router(auth_router)
+app.include_router(health_router)
+
+# Prometheus metrics endpoint
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
+
+# 设置应用信息
+app_info.info({
+    'version': '1.0.0',
+    'environment': settings.APP_ENV
+})
 
 
 @app.get("/")
@@ -147,6 +174,10 @@ async def upload_document(
         indexer.index_document_blocks(str(doc.doc_id), str(rev.rev_id), db)
     except Exception as e:
         print(f"索引失败（不影响上传）: {e}")
+    
+    # 记录指标
+    from app.monitoring.metrics import documents_uploaded
+    documents_uploaded.labels(user_id=str(current_user.user_id)).inc()
     
     return UploadDocumentResponse(
         doc_id=str(doc.doc_id),
