@@ -102,6 +102,20 @@ class ApplyEditsNode:
             
             self.db.commit()
             
+            # 8. 更新 Meilisearch 索引
+            try:
+                from app.services.search_indexer import get_indexer
+                indexer = get_indexer()
+                indexer.update_index_for_new_revision(
+                    str(doc_id),
+                    str(active_rev_id),
+                    str(new_rev.rev_id),
+                    changed_block_ids,
+                    self.db
+                )
+            except Exception as e:
+                print(f"索引更新失败（不影响修改）: {e}")
+            
             state["apply_result"] = ApplyResult(
                 new_rev_id=str(new_rev.rev_id),
                 new_rev_no=new_rev_no,

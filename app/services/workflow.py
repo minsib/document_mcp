@@ -13,16 +13,23 @@ import uuid
 class EditWorkflow:
     """编辑工作流"""
     
-    def __init__(self, db: Session, redis_client=None):
+    def __init__(self, db: Session, cache_manager=None):
         self.db = db
-        self.redis = redis_client
+        if cache_manager:
+            self.cache = cache_manager
+        else:
+            try:
+                from app.services.cache import get_cache_manager
+                self.cache = get_cache_manager()
+            except:
+                self.cache = None
         
         # 初始化节点
         self.intent_parser = IntentParserNode()
         self.retriever = HybridRetriever(db)
         self.verifier = VerifierNode(db)
         self.planner = EditPlannerNode(db)
-        self.preview_generator = PreviewGeneratorNode(db, redis_client)
+        self.preview_generator = PreviewGeneratorNode(db, self.cache)
         self.apply_node = ApplyEditsNode(db)
     
     def execute(

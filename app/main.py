@@ -132,6 +132,14 @@ async def upload_document(
     
     db.commit()
     
+    # 索引到 Meilisearch
+    try:
+        from app.services.search_indexer import get_indexer
+        indexer = get_indexer()
+        indexer.index_document_blocks(str(doc.doc_id), str(rev.rev_id), db)
+    except Exception as e:
+        print(f"索引失败（不影响上传）: {e}")
+    
     return UploadDocumentResponse(
         doc_id=str(doc.doc_id),
         rev_id=str(rev.rev_id),
@@ -212,25 +220,53 @@ async def confirm_edit(
     db: Session = Depends(get_db)
 ):
     """确认编辑"""
-    import json
     import hashlib
-    import time
     from app.models.schemas import EditPlan
     from app.nodes.apply import ApplyEditsNode
+    from app.services.cache import get_cache_manager
     
     # 模拟用户 ID
     user_id = str(uuid.uuid4())
     
-    # TODO: 从 Redis 获取 token payload
-    # 这里简化处理，实际应该从 Redis 读取
+    # 获取 cache manager
+    cache = get_cache_manager()
     
-    if request.action == "cancel":
+    # 1. 获取 token payload
+    payload = cache.get_confirm_token(request.session_id, request.confirm_token)
+    
+    if not payload:
         return ConfirmResponse(
-            status="cancelled",
-            message="已取消修改"
+            status="failed",
+            message="Token 无效或已过期",
+            error={"code": "invalid_token", "message": "Token 无效或已过期"}
         )
     
-    # 获取 active_revision
+    # 2. 基础校验
+    if payload["doc_id"] != request.doc_id:
+        return ConfirmResponse(
+            status="failed",
+            message="Token doc_id 不匹配",
+            error={"code": "token_mismatch", "message": "Token doc_id 不匹配"}
+        )
+    
+    if payload["session_id"] != request.session_id:
+        return ConfirmResponse(
+            status="failed",
+            message="Token session_id 不匹配",
+            error={"code": "token_mismatch", "message": "Token session_id 不匹配"}
+        )
+    
+    # 3. 过期校验
+    import time
+    if time.time() > payload["expires_at"]:
+        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        return ConfirmResponse(
+            status="failed",
+            message="Token 已过期",
+            error={"code": "token_expired", "message": "Token 已过期"}
+        )
+    
+    # 4. 获取当前 active_revision
     doc_uuid = uuid.UUID(request.doc_id)
     active_rev = db.query(db_models.DocumentActiveRevision).filter(
         db_models.DocumentActiveRevision.doc_id == doc_uuid
@@ -243,12 +279,111 @@ async def confirm_edit(
             error={"code": "doc_not_found", "message": "文档不存在"}
         )
     
-    # 简化版：直接返回成功
-    # 实际应该验证 token 并执行修改
-    return ConfirmResponse(
-        status="applied",
-        message="修改已应用（简化版）"
-    )
+    # 5. 版本校验
+    if payload["active_rev_id"] != str(active_rev.rev_id):
+        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        return ConfirmResponse(
+            status="failed",
+            message="文档已被他人修改，预览已失效",
+            error={
+                "code": "document_modified",
+                "message": "文档已被他人修改，预览已失效",
+                "current_rev_id": str(active_rev.rev_id),
+                "token_rev_id": payload["active_rev_id"]
+            }
+        )
+    
+    if payload["active_version"] != active_rev.version:
+        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        return ConfirmResponse(
+            status="failed",
+            message="文档版本已变更，预览已失效",
+            error={
+                "code": "version_mismatch",
+                "message": "文档版本已变更，预览已失效",
+                "current_version": active_rev.version,
+                "token_version": payload["active_version"]
+            }
+        )
+    
+    # 6. 取消操作
+    if request.action == "cancel":
+        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        return ConfirmResponse(
+            status="cancelled",
+            message="已取消修改"
+        )
+    
+    # 7. preview_hash 校验
+    if not request.preview_hash:
+        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        return ConfirmResponse(
+            status="failed",
+            message="缺少 preview_hash",
+            error={"code": "missing_preview_hash", "message": "缺少 preview_hash"}
+        )
+    
+    if request.preview_hash != payload.get("preview_hash"):
+        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        return ConfirmResponse(
+            status="failed",
+            message="预览内容已变更，请重新确认",
+            error={"code": "preview_hash_mismatch", "message": "预览内容已变更"}
+        )
+    
+    # 8. plan_hash 校验
+    edit_plan = EditPlan(**payload["edit_plan"])
+    plan_json = json.dumps(edit_plan.model_dump(), sort_keys=True)
+    plan_hash = hashlib.sha256(plan_json.encode()).hexdigest()
+    
+    if plan_hash != payload.get("plan_hash"):
+        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        return ConfirmResponse(
+            status="failed",
+            message="编辑计划已被篡改",
+            error={"code": "plan_hash_mismatch", "message": "编辑计划已被篡改"}
+        )
+    
+    # 9. 执行修改
+    state = {
+        "doc_id": request.doc_id,
+        "session_id": request.session_id,
+        "user_id": user_id,
+        "active_rev_id": str(active_rev.rev_id),
+        "active_version": active_rev.version,
+        "edit_plan": edit_plan,
+        "retry_count": 0,
+        "max_retries": 2
+    }
+    
+    apply_node = ApplyEditsNode(db)
+    result = apply_node(state)
+    
+    # 10. 删除 token（一次性使用）
+    cache.delete_confirm_token(request.session_id, request.confirm_token)
+    
+    if result.get("apply_result"):
+        # 导出文档
+        from app.services.workflow import EditWorkflow
+        workflow = EditWorkflow(db, cache)
+        export_md = workflow._export_document(result["apply_result"].new_rev_id)
+        
+        return ConfirmResponse(
+            status="applied",
+            new_rev_id=result["apply_result"].new_rev_id,
+            export_md=export_md,
+            message="修改已应用"
+        )
+    else:
+        error = result.get("error", {})
+        if hasattr(error, 'model_dump'):
+            error = error.model_dump()
+        
+        return ConfirmResponse(
+            status="failed",
+            message=error.get("message", "应用修改失败"),
+            error=error
+        )
 
 
 if __name__ == "__main__":

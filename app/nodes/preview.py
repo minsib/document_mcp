@@ -12,9 +12,16 @@ import time
 class PreviewGeneratorNode:
     """预览生成节点"""
     
-    def __init__(self, db: Session, redis_client=None):
+    def __init__(self, db: Session, cache_manager=None):
         self.db = db
-        self.redis = redis_client
+        if cache_manager:
+            self.cache = cache_manager
+        else:
+            try:
+                from app.services.cache import get_cache_manager
+                self.cache = get_cache_manager()
+            except:
+                self.cache = None
     
     def __call__(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """生成预览"""
@@ -121,13 +128,17 @@ class PreviewGeneratorNode:
             "expires_at": time.time() + 900  # 15 分钟
         }
         
-        # 存储到 Redis（如果可用）
-        if self.redis:
-            self.redis.setex(
-                f"confirm_token:{state['session_id']}:{token_id}",
-                900,
-                json.dumps(payload)
+        # 存储到 Redis
+        if self.cache:
+            success = self.cache.store_confirm_token(
+                state["session_id"],
+                token_id,
+                payload,
+                900
             )
+            if not success:
+                # 降级：存储到状态中
+                state["_confirm_payload"] = payload
         else:
             # 降级：存储到状态中（仅用于测试）
             state["_confirm_payload"] = payload
