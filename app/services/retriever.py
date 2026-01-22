@@ -36,7 +36,12 @@ class HybridRetriever:
         """
         if self.use_meilisearch and self.indexer:
             try:
-                return self._meilisearch_search(query, doc_id, rev_id, scope_hint, top_k)
+                results = self._meilisearch_search(query, doc_id, rev_id, scope_hint, top_k)
+                if results:
+                    return results
+                # 如果 Meilisearch 返回空结果，尝试简单搜索
+                print("Meilisearch 返回空结果，尝试简单搜索")
+                return self._simple_search(query, doc_id, rev_id, scope_hint, top_k)
             except Exception as e:
                 print(f"Meilisearch 搜索失败，降级到简单匹配: {e}")
                 return self._simple_search(query, doc_id, rev_id, scope_hint, top_k)
