@@ -1,0 +1,112 @@
+groups:
+  - name: document_edit_system
+    interval: 30s
+    rules:
+      # 服务可用性告警
+      - alert: ServiceDown
+        expr: up{job="document-edit-system"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Document Edit System is down"
+          description: "The service has been down for more than 1 minute"
+      
+      # 高错误率告警
+      - alert: HighErrorRate
+        expr: rate(errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value }} errors/sec (threshold: 0.1)"
+      
+      # 慢响应告警
+      - alert: SlowResponse
+        expr: histogram_quantile(0.95, rate(request_duration_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow response time detected"
+          description: "P95 response time is {{ $value }}s (threshold: 5s)"
+      
+      # 数据库连接池告警
+      - alert: DatabaseConnectionPoolHigh
+        expr: db_connections_active > 18
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Database connection pool nearly exhausted"
+          description: "Active connections: {{ $value }}/20 (threshold: 18)"
+      
+      - alert: DatabaseConnectionPoolExhausted
+        expr: db_connections_active >= 20
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database connection pool exhausted"
+          description: "All 20 database connections are in use"
+      
+      # LLM API 失败率告警
+      - alert: HighLLMFailureRate
+        expr: rate(llm_calls_total{status="failed"}[5m]) / rate(llm_calls_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High LLM API failure rate"
+          description: "LLM API failure rate is {{ $value | humanizePercentage }} (threshold: 10%)"
+      
+      # 检索失败率告警
+      - alert: HighSearchFailureRate
+        expr: rate(searches_performed_total{status="failed"}[5m]) / rate(searches_performed_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High search failure rate"
+          description: "Search failure rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+      
+      # 编辑失败率告警
+      - alert: HighEditFailureRate
+        expr: rate(edits_failed_total[5m]) / rate(edits_requested_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High edit failure rate"
+          description: "Edit failure rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+      
+      # 认证失败率告警
+      - alert: HighAuthFailureRate
+        expr: rate(auth_login_attempts_total{status="failed"}[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High authentication failure rate"
+          description: "Auth failure rate is {{ $value }} attempts/sec (possible brute force attack)"
+      
+      # Redis 连接失败告警
+      - alert: RedisConnectionFailed
+        expr: redis_connection_errors_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis connection failed"
+          description: "Cannot connect to Redis cache"
+      
+      # Meilisearch 连接失败告警
+      - alert: MeilisearchConnectionFailed
+        expr: meilisearch_connection_errors_total > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Meilisearch connection failed"
+          description: "Cannot connect to Meilisearch (system will use fallback search)"

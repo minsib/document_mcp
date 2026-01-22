@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Security
+from fastapi import FastAPI, Depends, HTTPException, status, Security, Form, File, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -6,6 +6,7 @@ from prometheus_client import make_asgi_app
 import uuid
 from typing import Optional
 import logging
+import json
 
 from app.config import get_settings
 from app.db.connection import get_db, engine
@@ -177,7 +178,7 @@ async def upload_document(
     
     # 记录指标
     from app.monitoring.metrics import documents_uploaded
-    documents_uploaded.labels(user_id=str(current_user.user_id)).inc()
+    documents_uploaded.labels(user_id=str(user_id)).inc()
     
     return UploadDocumentResponse(
         doc_id=str(doc.doc_id),
