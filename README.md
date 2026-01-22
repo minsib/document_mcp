@@ -9,12 +9,14 @@
 ### 核心特性
 
 - 🤖 **对话式编辑**：用自然语言描述修改需求，AI 自动定位并修改
-- 🎯 **精准定位**：混合检索（BM25 + 向量检索 + 重排）确保定位准确
+- 🎯 **精准定位**：混合检索（BM25 + 向量检索 + RRF 融合）确保定位准确
+- 🧠 **语义理解**：向量检索支持语义搜索，理解查询意图
 - 📝 **版本管理**：完整的版本历史，支持任意版本回滚
 - 🔍 **预览确认**：修改前预览 diff，确认后执行
 - 🔄 **批量修改**：支持全文统一替换和批量编辑
 - 🔒 **并发安全**：乐观锁机制，防止并发冲突
 - 📊 **完整审计**：所有操作可追溯，支持审计查询
+- ⚡ **智能降级**：多级降级策略确保系统稳定性
 
 ## 技术架构
 
@@ -395,6 +397,23 @@ docker build -t document-edit:latest .
 docker-compose up -d
 ```
 
+### 启用向量检索（推荐）
+
+向量检索可以显著提升语义搜索准确率。启用步骤：
+
+```bash
+# 1. 添加 pgvector 支持
+python scripts/add_vector_support.py
+
+# 2. 为现有文档生成 embeddings
+python scripts/regenerate_embeddings.py
+
+# 3. 验证安装
+psql -h localhost -p 5435 -U postgres -d document_edit -c "SELECT COUNT(*) FROM block_versions WHERE embedding IS NOT NULL;"
+```
+
+详细说明请参考 [VECTOR_SEARCH_SETUP.md](VECTOR_SEARCH_SETUP.md)
+
 ### 生产环境配置
 
 ```bash
@@ -410,7 +429,7 @@ gunicorn app.main:app \
 
 ## 性能指标
 
-- **定位准确率**：> 85%（混合检索 + 重排）
+- **定位准确率**：> 90%（混合检索 + RRF 融合）
 - **单次编辑延迟**：< 3 秒（P95）
 - **并发支持**：100+ 并发编辑请求
 - **可用性**：99.9% SLA
@@ -430,9 +449,16 @@ gunicorn app.main:app \
 ### Q: 如何提高定位准确率？
 
 A: 
-1. 启用向量检索（需要配置 embedding API）
+1. **启用向量检索**（推荐）：运行 `python scripts/add_vector_support.py`
 2. 提供更具体的上下文（如章节名称）
-3. 使用用户反馈训练重排模型
+3. 使用混合检索（BM25 + 向量 + RRF）
+
+### Q: 向量检索的成本如何？
+
+A:
+- 存储：每个块约 6KB embedding 数据
+- API：Qwen embedding API 约 ¥0.0001/1K tokens
+- 1000 个块约需 ¥0.02 + 6MB 存储
 
 ### Q: 如何处理大文档（> 10MB）？
 

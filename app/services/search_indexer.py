@@ -1,18 +1,20 @@
 """
-Meilisearch 索引管理
+Meilisearch 索引管理 + Embedding 生成
 """
 from typing import List, Set
 import meilisearch
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from app.models import database as db_models
 from app.config import get_settings
+from app.services.embedding import get_embedding_service
 import uuid
 
 settings = get_settings()
 
 
 class MeilisearchIndexer:
-    """Meilisearch 索引管理器"""
+    """Meilisearch 索引管理器 + Embedding 生成器"""
     
     def __init__(self):
         self.client = meilisearch.Client(
@@ -20,6 +22,7 @@ class MeilisearchIndexer:
             settings.MEILI_MASTER_KEY
         )
         self.index_name = "doc_blocks"
+        self.embedding_service = get_embedding_service()
         self._ensure_index()
     
     def _ensure_index(self):
@@ -62,7 +65,7 @@ class MeilisearchIndexer:
         ])
     
     def index_document_blocks(self, doc_id: str, rev_id: str, db: Session):
-        """索引文档的所有块"""
+        """索引文档的所有块 + 生成 embeddings"""
         doc_uuid = uuid.UUID(doc_id)
         rev_uuid = uuid.UUID(rev_id)
         
@@ -73,6 +76,9 @@ class MeilisearchIndexer:
         
         # 构建文档
         documents = []
+        texts_for_embedding = []
+        block_version_ids = []
+        
         for block in blocks:
             # 获取父级标题
             parent_heading_text = self._get_parent_heading(block, db)
@@ -94,11 +100,40 @@ class MeilisearchIndexer:
                 'created_at': int(block.created_at.timestamp()) if block.created_at else 0
             }
             documents.append(doc)
+            
+            # 准备 embedding 文本（包含标题上下文）
+            embedding_text = f"{parent_heading_text or ''}\n\n{block.plain_text or ''}"
+            texts_for_embedding.append(embedding_text)
+            block_version_ids.append(block.block_version_id)
         
-        # 批量索引
+        # 批量索引到 Meilisearch
         if documents:
             index = self.client.get_index(self.index_name)
             index.add_documents(documents)
+        
+        # 批量生成 embeddings 并存储到数据库
+        if texts_for_embedding:
+            try:
+                embeddings = self.embedding_service.generate_embeddings_batch(texts_for_embedding)
+                
+                # 批量更新数据库
+                for block_version_id, embedding in zip(block_version_ids, embeddings):
+                    db.execute(
+                        text("""
+                            UPDATE block_versions 
+                            SET embedding = :embedding::vector
+                            WHERE block_version_id = :block_version_id
+                        """),
+                        {
+                            'embedding': str(embedding),
+                            'block_version_id': block_version_id
+                        }
+                    )
+                db.commit()
+                print(f"✅ 成功生成并存储 {len(embeddings)} 个 embeddings")
+            except Exception as e:
+                print(f"⚠️ Embedding 生成失败（不影响主流程）: {e}")
+                # 不抛出异常，允许继续
     
     def update_index_for_new_revision(
         self,

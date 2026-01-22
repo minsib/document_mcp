@@ -1,18 +1,22 @@
 from typing import List, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from app.models.schemas import BlockCandidate, ScopeHint
 from app.models import database as db_models
 from app.utils.markdown import normalize_text
 from app.services.search_indexer import get_indexer
+from app.services.embedding import get_embedding_service
 import uuid
 
 
 class HybridRetriever:
-    """混合检索器（BM25 + 向量检索）"""
+    """混合检索器（BM25 + 向量检索 + RRF 融合）"""
     
-    def __init__(self, db: Session, use_meilisearch: bool = True):
+    def __init__(self, db: Session, use_meilisearch: bool = True, use_vector: bool = True):
         self.db = db
         self.use_meilisearch = use_meilisearch
+        self.use_vector = use_vector
+        
         if use_meilisearch:
             try:
                 self.indexer = get_indexer()
@@ -21,6 +25,15 @@ class HybridRetriever:
                 self.indexer = None
         else:
             self.indexer = None
+        
+        if use_vector:
+            try:
+                self.embedding_service = get_embedding_service()
+            except:
+                self.use_vector = False
+                self.embedding_service = None
+        else:
+            self.embedding_service = None
     
     def search(
         self,
@@ -31,22 +44,167 @@ class HybridRetriever:
         top_k: int = 10
     ) -> List[BlockCandidate]:
         """
-        混合检索
-        优先使用 Meilisearch，失败则降级到简单匹配
+        混合检索（BM25 + 向量 + RRF 融合）
+        优先使用混合检索，失败则降级
         """
+        # 尝试混合检索（BM25 + 向量）
+        if self.use_meilisearch and self.use_vector and self.indexer and self.embedding_service:
+            try:
+                results = self._hybrid_search(query, doc_id, rev_id, scope_hint, top_k)
+                if results:
+                    return results
+                print("混合检索返回空结果，尝试 Meilisearch 搜索")
+            except Exception as e:
+                print(f"混合检索失败: {e}")
+        
+        # 降级到 Meilisearch
         if self.use_meilisearch and self.indexer:
             try:
                 results = self._meilisearch_search(query, doc_id, rev_id, scope_hint, top_k)
                 if results:
                     return results
-                # 如果 Meilisearch 返回空结果，尝试简单搜索
                 print("Meilisearch 返回空结果，尝试简单搜索")
-                return self._simple_search(query, doc_id, rev_id, scope_hint, top_k)
             except Exception as e:
                 print(f"Meilisearch 搜索失败，降级到简单匹配: {e}")
-                return self._simple_search(query, doc_id, rev_id, scope_hint, top_k)
-        else:
-            return self._simple_search(query, doc_id, rev_id, scope_hint, top_k)
+        
+        # 最终降级到简单搜索
+        return self._simple_search(query, doc_id, rev_id, scope_hint, top_k)
+    
+    def _hybrid_search(
+        self,
+        query: str,
+        doc_id: str,
+        rev_id: str,
+        scope_hint: Optional[ScopeHint],
+        top_k: int
+    ) -> List[BlockCandidate]:
+        """混合检索：BM25 + 向量 + RRF 融合"""
+        # 1. BM25 召回
+        bm25_results = self._meilisearch_search(query, doc_id, rev_id, scope_hint, top_k * 2)
+        
+        # 2. 向量召回
+        vector_results = self._vector_search(query, doc_id, rev_id, scope_hint, top_k * 2)
+        
+        # 3. RRF 融合
+        combined = self._reciprocal_rank_fusion(
+            [bm25_results, vector_results],
+            k=60
+        )
+        
+        return combined[:top_k]
+    
+    def _vector_search(
+        self,
+        query: str,
+        doc_id: str,
+        rev_id: str,
+        scope_hint: Optional[ScopeHint],
+        top_k: int
+    ) -> List[BlockCandidate]:
+        """向量相似度搜索"""
+        # 生成查询向量
+        query_embedding = self.embedding_service.generate_embedding(query)
+        
+        # 构建 SQL 查询
+        rev_uuid = uuid.UUID(rev_id)
+        
+        # 使用余弦距离搜索
+        sql = text("""
+            SELECT 
+                bv.block_id,
+                bv.plain_text,
+                bv.order_index,
+                bv.block_type,
+                bv.embedding <=> :embedding::vector AS distance
+            FROM block_versions bv
+            WHERE bv.rev_id = :rev_id
+                AND bv.embedding IS NOT NULL
+            ORDER BY distance
+            LIMIT :limit
+        """)
+        
+        results = self.db.execute(
+            sql,
+            {
+                'embedding': str(query_embedding),
+                'rev_id': rev_uuid,
+                'limit': top_k
+            }
+        ).fetchall()
+        
+        # 转换为 BlockCandidate
+        candidates = []
+        for row in results:
+            # 距离转换为分数（0-1）
+            score = 1.0 / (1.0 + row.distance)
+            
+            # 获取父级标题
+            parent_heading = self._get_parent_heading_by_id(str(row.block_id), rev_id)
+            
+            # 应用 scope_hint 加权
+            if scope_hint:
+                if scope_hint.heading and parent_heading:
+                    if scope_hint.heading.lower() in parent_heading.lower():
+                        score += 0.3
+                
+                if scope_hint.keywords:
+                    for keyword in scope_hint.keywords:
+                        if normalize_text(keyword) in normalize_text(row.plain_text):
+                            score += 0.2
+            
+            candidates.append(BlockCandidate(
+                block_id=str(row.block_id),
+                snippet=row.plain_text[:200] if row.plain_text else '',
+                heading_context=parent_heading or "（无标题）",
+                order_index=row.order_index,
+                score=min(score, 1.0),
+                block_type=row.block_type
+            ))
+        
+        return candidates
+    
+    def _reciprocal_rank_fusion(
+        self,
+        result_lists: List[List[BlockCandidate]],
+        k: int = 60
+    ) -> List[BlockCandidate]:
+        """
+        RRF (Reciprocal Rank Fusion) 算法
+        
+        公式: RRF(d) = Σ 1 / (k + rank(d))
+        其中 k 是常数（通常为 60），rank(d) 是文档在列表中的排名
+        """
+        # 收集所有候选
+        all_candidates = {}
+        
+        for result_list in result_lists:
+            for rank, candidate in enumerate(result_list, start=1):
+                block_id = candidate.block_id
+                
+                if block_id not in all_candidates:
+                    all_candidates[block_id] = {
+                        'candidate': candidate,
+                        'rrf_score': 0.0
+                    }
+                
+                # 累加 RRF 分数
+                all_candidates[block_id]['rrf_score'] += 1.0 / (k + rank)
+        
+        # 按 RRF 分数排序
+        sorted_candidates = sorted(
+            all_candidates.values(),
+            key=lambda x: x['rrf_score'],
+            reverse=True
+        )
+        
+        # 更新候选的分数为 RRF 分数
+        result = []
+        for item in sorted_candidates:
+            candidate = item['candidate']
+            candidate.score = item['rrf_score']
+            result.append(candidate)
+        
+        return result
     
     def _meilisearch_search(
         self,
@@ -164,6 +322,21 @@ class HybridRetriever:
         candidates.sort(key=lambda x: x.score, reverse=True)
         
         return candidates[:top_k]
+    
+    def _get_parent_heading_by_id(self, block_id: str, rev_id: str) -> Optional[str]:
+        """通过 block_id 获取父级标题"""
+        block_uuid = uuid.UUID(block_id)
+        rev_uuid = uuid.UUID(rev_id)
+        
+        block = self.db.query(db_models.BlockVersion).filter(
+            db_models.BlockVersion.block_id == block_uuid,
+            db_models.BlockVersion.rev_id == rev_uuid
+        ).first()
+        
+        if not block:
+            return None
+        
+        return self._get_parent_heading(block)
     
     def _get_parent_heading(self, block: db_models.BlockVersion) -> Optional[str]:
         """获取父级标题"""
