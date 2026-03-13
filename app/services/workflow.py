@@ -1,6 +1,7 @@
 from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
 from app.nodes.intent_parser import IntentParserNode
+from app.nodes.intent_clarifier import IntentClarifierNode, SemanticConflictDetector
 from app.nodes.verifier import VerifierNode
 from app.nodes.planner import EditPlannerNode
 from app.nodes.preview import PreviewGeneratorNode
@@ -27,6 +28,8 @@ class EditWorkflow:
         
         # 初始化节点
         self.intent_parser = IntentParserNode()
+        self.intent_clarifier = IntentClarifierNode(db)
+        self.conflict_detector = SemanticConflictDetector(db)
         self.retriever = HybridRetriever(db)
         self.verifier = VerifierNode(db)
         self.planner = EditPlannerNode(db)
@@ -96,6 +99,21 @@ class EditWorkflow:
             if state.get("error"):
                 return self._handle_error(state)
             
+            # 1.5 意图澄清检查
+            state = self.intent_clarifier(state)
+            if state.get("needs_clarification"):
+                clarification = state["clarification"]
+                return ChatEditResponse(
+                    status="need_clarification",
+                    message=clarification["message"],
+                    clarification={
+                        "type": clarification["type"],
+                        "question": clarification["question"],
+                        "options": clarification.get("options", []),
+                        "severity": clarification["severity"]
+                    }
+                )
+            
             # 2. 检索候选
             intent = state["intent"]
             try:
@@ -159,12 +177,24 @@ class EditWorkflow:
             
             # 6. 判断是否需要确认
             if state.get("need_user_action") == "confirm_preview":
+                message = "请确认以下修改"
+                
+                # 如果有语义冲突警告，添加到消息中
+                warnings = state.get("warnings", [])
+                if warnings:
+                    warning_msgs = []
+                    for w in warnings:
+                        if w["type"] == "semantic_conflict":
+                            warning_msgs.append(f"⚠️ {w['message']}")
+                    if warning_msgs:
+                        message += "\n\n" + "\n".join(warning_msgs)
+                
                 return ChatEditResponse(
                     status="need_confirm",
                     preview=state["preview_diff"],
                     confirm_token=state["confirm_token"],
                     preview_hash=state["preview_hash"],
-                    message="请确认以下修改"
+                    message=message
                 )
             
             # 7. 直接应用（低风险操作）

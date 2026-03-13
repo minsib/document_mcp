@@ -5,6 +5,7 @@ from typing import List, Set
 from app.models.schemas import Intent, BlockCandidate
 from app.services.search_indexer import get_indexer
 from app.models import database as db_models
+from app.utils.intent_helper import get_intent_attr
 from sqlalchemy.orm import Session
 import re
 
@@ -39,15 +40,25 @@ class BulkDiscoverNode:
             匹配的块列表
         """
         # 构建查询
-        if intent.match_type == "exact_term":
+        match_type = get_intent_attr(intent, "match_type", "semantic")
+        scope_filter = get_intent_attr(intent, "scope_filter", {})
+        scope_hint = get_intent_attr(intent, "scope_hint", None)
+        
+        if match_type == "exact_term":
             # 精确词匹配
-            query = intent.scope_filter.get("term", "")
-        elif intent.match_type == "regex":
+            query = scope_filter.get("term", "") if scope_filter else ""
+        elif match_type == "regex":
             # 正则表达式匹配（需要全量拉取后过滤）
             query = ""
         else:
             # 语义匹配
-            query = " ".join(intent.scope_hint.keywords) if intent.scope_hint.keywords else ""
+            keywords = []
+            if scope_hint:
+                if isinstance(scope_hint, dict):
+                    keywords = scope_hint.get("keywords", [])
+                else:
+                    keywords = getattr(scope_hint, "keywords", [])
+            query = " ".join(keywords) if keywords else ""
         
         # 召回候选
         if self.indexer and query:
@@ -155,24 +166,42 @@ class BulkDiscoverNode:
         """按 scope_filter 过滤"""
         filtered = candidates
         
+        scope_hint = get_intent_attr(intent, "scope_hint", None)
+        match_type = get_intent_attr(intent, "match_type", "semantic")
+        scope_filter = get_intent_attr(intent, "scope_filter", {})
+        
         # 按 block_type 过滤
-        if intent.scope_hint and intent.scope_hint.block_type:
-            filtered = [
-                c for c in filtered 
-                if c.block_type == intent.scope_hint.block_type
-            ]
+        if scope_hint:
+            block_type = None
+            if isinstance(scope_hint, dict):
+                block_type = scope_hint.get("block_type")
+            else:
+                block_type = getattr(scope_hint, "block_type", None)
+            
+            if block_type:
+                filtered = [
+                    c for c in filtered 
+                    if c.block_type == block_type
+                ]
         
         # 按 heading 过滤
-        if intent.scope_hint and intent.scope_hint.heading:
-            heading_keyword = intent.scope_hint.heading.lower()
-            filtered = [
-                c for c in filtered 
-                if heading_keyword in c.heading_context.lower()
-            ]
+        if scope_hint:
+            heading = None
+            if isinstance(scope_hint, dict):
+                heading = scope_hint.get("heading")
+            else:
+                heading = getattr(scope_hint, "heading", None)
+            
+            if heading:
+                heading_keyword = heading.lower()
+                filtered = [
+                    c for c in filtered 
+                    if heading_keyword in c.heading_context.lower()
+                ]
         
         # 按 regex 过滤
-        if intent.match_type == "regex" and intent.scope_filter:
-            pattern_str = intent.scope_filter.get("pattern", "")
+        if match_type == "regex" and scope_filter:
+            pattern_str = scope_filter.get("pattern", "") if isinstance(scope_filter, dict) else ""
             if pattern_str:
                 try:
                     pattern = re.compile(pattern_str)
@@ -184,8 +213,8 @@ class BulkDiscoverNode:
                     print(f"正则表达式错误: {e}")
         
         # 按精确词过滤
-        if intent.match_type == "exact_term" and intent.scope_filter:
-            term = intent.scope_filter.get("term", "")
+        if match_type == "exact_term" and scope_filter:
+            term = scope_filter.get("term", "") if isinstance(scope_filter, dict) else ""
             if term:
                 filtered = [
                     c for c in filtered 

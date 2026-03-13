@@ -32,8 +32,8 @@ class EmbeddingService:
             return response.data[0].embedding
         except Exception as e:
             print(f"Embedding 生成失败: {e}")
-            # 返回零向量作为降级
-            return [0.0] * 1536
+            # 返回零向量作为降级 (Qwen text-embedding-v3 是 1024 维)
+            return [0.0] * 1024
     
     def generate_embeddings_batch(self, texts: List[str], batch_size: int = 10) -> List[List[float]]:
         """批量生成 embeddings（Qwen API 限制每批最多 10 个）"""
@@ -56,8 +56,8 @@ class EmbeddingService:
                 embeddings.extend(batch_embeddings)
             except Exception as e:
                 print(f"批量 embedding 生成失败: {e}")
-                # 返回零向量
-                embeddings.extend([[0.0] * 1536 for _ in batch])
+                # 返回零向量 (Qwen text-embedding-v3 是 1024 维)
+                embeddings.extend([[0.0] * 1024 for _ in batch])
         
         return embeddings
     

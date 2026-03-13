@@ -61,11 +61,14 @@
 
 ### 环境要求
 
+**后端**:
 - Python 3.11+
 - PostgreSQL 15+ (with pgvector extension)
 - Redis 7+
 - Meilisearch 1.5+
 - **Qwen API Key**（必需）
+
+
 
 ### 获取 Qwen API Key
 
@@ -159,17 +162,20 @@ meilisearch --master-key=your_master_key --http-addr 127.0.0.1:7702
 # 启动 Redis（使用自定义端口）
 redis-server --port 6382
 
-# 启动 API 服务
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+# 启动后端 API 服务
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 ```
 
-7. **访问 API 文档**
+7. **访问应用**
 
-打开浏览器访问：http://localhost:8000/docs
+- API 文档：http://localhost:8001/docs
+- 健康检查：http://localhost:8001/health
 
 ## 使用示例
 
-### 0. 用户认证
+### 使用 API（推荐）
+
+#### 0. 用户认证
 
 ```bash
 # 注册用户
@@ -330,50 +336,40 @@ curl -X POST "http://localhost:8000/v1/docs/550e8400-e29b-41d4-a716-446655440000
 
 ```
 document_mcp/
-├── app/
+├── app/                        # 后端应用
 │   ├── main.py                 # FastAPI 应用入口
 │   ├── config.py               # 配置管理
 │   ├── models/                 # 数据模型
 │   │   ├── database.py         # SQLAlchemy 模型
 │   │   └── schemas.py          # Pydantic 模型
 │   ├── api/                    # API 路由
-│   │   ├── docs.py             # 文档管理 API
-│   │   ├── chat.py             # 对话编辑 API
-│   │   └── revisions.py        # 版本管理 API
+│   ├── auth/                   # 认证模块
 │   ├── services/               # 业务逻辑
 │   │   ├── splitter.py         # 文档分块
 │   │   ├── retriever.py        # 混合检索
-│   │   ├── workflow.py         # LangGraph 工作流
+│   │   ├── langgraph_workflow.py  # LangGraph 工作流 ⭐ 新架构
 │   │   └── cache.py            # 缓存管理
-│   ├── nodes/                  # LangGraph 节点
-│   │   ├── intent_parser.py    # 意图解析
-│   │   ├── retriever.py        # 检索节点
-│   │   ├── verifier.py         # 验证节点
-│   │   ├── planner.py          # 计划生成
-│   │   ├── preview.py          # 预览生成
-│   │   └── apply.py            # 执行节点
-│   ├── utils/                  # 工具函数
-│   │   ├── markdown.py         # Markdown 处理
-│   │   ├── hash.py             # 哈希计算
-│   │   └── validation.py       # 校验工具
-│   └── db/                     # 数据库操作
-│       ├── connection.py       # 连接管理
-│       └── dao.py              # 数据访问层
+│   ├── agents/                 # 智能体层 ⭐ 新架构
+│   │   ├── intent_agent.py     # 意图理解智能体
+│   │   ├── router_agent.py     # 路由决策智能体
+│   │   ├── clarify_agent.py    # 澄清确认智能体
+│   │   ├── retrieval_agent.py  # 检索定位智能体
+│   │   └── edit_agent.py       # 编辑执行智能体
+│   ├── tools/                  # 工具层 ⭐ 新架构
+│   │   ├── db_tools.py         # 数据库工具
+│   │   ├── search_tools.py     # 检索工具
+│   │   ├── llm_tools.py        # LLM 工具
+│   │   └── index_tools.py      # 索引工具
+│   ├── nodes/                  # 工作流节点（旧架构，待迁移）
+│   ├── monitoring/             # 监控模块
+│   └── utils/                  # 工具函数
 ├── alembic/                    # 数据库迁移
-│   ├── versions/
-│   └── env.py
-├── tests/                      # 测试
-│   ├── test_api.py
-│   ├── test_workflow.py
-│   └── test_retriever.py
-├── docs/                       # 文档
-│   ├── design.md               # 设计文档
-│   └── api.md                  # API 文档
+├── scripts/                    # 脚本工具
 ├── .env.example                # 环境变量示例
 ├── requirements.txt            # Python 依赖
-├── alembic.ini                 # Alembic 配置
-├── Dockerfile                  # Docker 镜像
 ├── docker-compose.yml          # Docker Compose
+├── REFACTORING_TO_LANGGRAPH.md # 重构规划文档 ⭐
+├── REFACTORING_PROGRESS.md     # 重构进度报告 ⭐
 └── README.md                   # 本文件
 ```
 
@@ -565,16 +561,22 @@ A:
 - ✅ 批量修改
 - ✅ 用户认证系统
 - ✅ 基础监控
-- 🚧 多轮对话上下文
-- 🚧 用户反馈学习
+- ✅ 意图澄清机制
 
-### Phase 3: 性能优化（部分完成）
-- ✅ 多级缓存
-- ✅ 增量索引
-- ⏳ Block Version 引用模式
-- ⏳ 分布式部署
+### Phase 3: 架构升级（进行中）⭐
+- 🚧 LangGraph 工作流重构
+- 🚧 智能体架构（Intent/Router/Retrieval/Edit）
+- 🚧 工具层封装
+- ⏳ 流式输出支持
+- ⏳ 完整的 Langfuse 追踪
 
-### Phase 4: 高级功能（未来）
+### Phase 4: 前端重构（计划中）
+- 📋 适配新架构的前端界面
+- 📋 实时工作流可视化
+- 📋 智能体执行状态展示
+- 📋 流式响应支持
+
+### Phase 5: 高级功能（未来）
 - 📋 协同编辑
 - 📋 AI 主动建议
 - 📋 自定义重排模型

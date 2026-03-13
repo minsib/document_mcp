@@ -27,6 +27,7 @@ class Intent(BaseModel):
     match_type: Optional[Literal["exact_term", "regex", "semantic"]] = None
     apply_scope: Optional[Literal["single", "all_matches", "within_heading"]] = None
     scope_filter: Optional[dict] = None
+    user_message: Optional[str] = Field(None, description="原始用户消息，用于跨段落引用解析")
 
 
 # ============ 定位相关 ============
@@ -122,7 +123,7 @@ class CandidateResponse(BaseModel):
 
 
 class ChatEditResponse(BaseModel):
-    status: Literal["need_disambiguation", "need_confirm", "applied", "failed"]
+    status: Literal["need_disambiguation", "need_confirm", "need_clarification", "applied", "failed"]
     candidates: Optional[List[CandidateResponse]] = None
     preview: Optional[PreviewDiff] = None
     confirm_token: Optional[str] = None
@@ -131,6 +132,7 @@ class ChatEditResponse(BaseModel):
     diff_summary: Optional[List[DiffItem]] = None
     export_md: Optional[str] = None
     error: Optional[dict] = None
+    clarification: Optional[dict] = Field(None, description="需要用户澄清的信息")
     message: str
 
 

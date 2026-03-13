@@ -120,17 +120,13 @@ class MeilisearchIndexer:
                 for block_version_id, embedding in zip(block_version_ids, embeddings):
                     # 将向量转换为字符串格式
                     embedding_str = '[' + ','.join(map(str, embedding)) + ']'
-                    db.execute(
-                        text("""
-                            UPDATE block_versions 
-                            SET embedding = :embedding::vector
-                            WHERE block_version_id = :block_version_id::uuid
-                        """),
-                        {
-                            'embedding': embedding_str,
-                            'block_version_id': str(block_version_id)
-                        }
-                    )
+                    # 使用原生SQL，避免参数绑定问题
+                    sql = f"""
+                        UPDATE block_versions 
+                        SET embedding = '{embedding_str}'::vector
+                        WHERE block_version_id = '{str(block_version_id)}'::uuid
+                    """
+                    db.execute(text(sql))
                 db.commit()
                 print(f"✅ 成功生成并存储 {len(embeddings)} 个 embeddings")
             except Exception as e:

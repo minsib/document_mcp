@@ -5,6 +5,7 @@ from typing import List, Dict
 from app.models.schemas import Intent, BlockCandidate, PreviewDiff, DiffItem
 from app.models import database as db_models
 from app.utils.markdown import strip_markdown
+from app.utils.intent_helper import get_intent_attr
 from sqlalchemy.orm import Session
 import uuid
 
@@ -115,19 +116,22 @@ class BulkPreviewNode:
         """
         content = block.content_md or ''
         
-        if intent.match_type == "exact_term":
+        match_type = get_intent_attr(intent, "match_type", "semantic")
+        scope_filter = get_intent_attr(intent, "scope_filter", {})
+        
+        if match_type == "exact_term":
             # 精确词替换
-            term = intent.scope_filter.get("term", "")
-            replacement = intent.scope_filter.get("replacement", "")
+            term = scope_filter.get("term", "") if scope_filter else ""
+            replacement = scope_filter.get("replacement", "") if scope_filter else ""
             
             if term and replacement:
                 return content.replace(term, replacement)
         
-        elif intent.match_type == "regex":
+        elif match_type == "regex":
             # 正则表达式替换
             import re
-            pattern_str = intent.scope_filter.get("pattern", "")
-            replacement = intent.scope_filter.get("replacement", "")
+            pattern_str = scope_filter.get("pattern", "") if scope_filter else ""
+            replacement = scope_filter.get("replacement", "") if scope_filter else ""
             
             if pattern_str and replacement:
                 try:

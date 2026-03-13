@@ -4,6 +4,7 @@ from sqlalchemy import text
 from app.models.schemas import BlockCandidate, ScopeHint
 from app.models import database as db_models
 from app.utils.markdown import normalize_text
+from app.utils.intent_helper import get_intent_attr
 from app.services.search_indexer import get_indexer
 from app.services.embedding import get_embedding_service
 import uuid
@@ -112,34 +113,22 @@ class HybridRetriever:
             # 将向量转换为字符串格式
             embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
             
-            # 使用余弦距离搜索 - 使用 bindparam 正确绑定参数
-            from sqlalchemy import bindparam
-            sql = text("""
+            # 使用余弦距离搜索 - 使用 format 构建 SQL
+            sql_query = f"""
                 SELECT 
                     bv.block_id,
                     bv.plain_text,
                     bv.order_index,
                     bv.block_type,
-                    bv.embedding <=> :embedding::vector AS distance
+                    bv.embedding <=> '{embedding_str}'::vector AS distance
                 FROM block_versions bv
-                WHERE bv.rev_id = :rev_id::uuid
+                WHERE bv.rev_id = '{str(rev_uuid)}'::uuid
                     AND bv.embedding IS NOT NULL
                 ORDER BY distance
-                LIMIT :limit
-            """).bindparams(
-                bindparam('embedding', type_=text),
-                bindparam('rev_id', type_=text),
-                bindparam('limit', type_=text)
-            )
+                LIMIT {top_k}
+            """
             
-            results = self.db.execute(
-                sql,
-                {
-                    'embedding': embedding_str,
-                    'rev_id': str(rev_uuid),
-                    'limit': str(top_k)
-                }
-            ).fetchall()
+            results = self.db.execute(text(sql_query)).fetchall()
             
             # 转换为 BlockCandidate
             candidates = []
@@ -152,14 +141,25 @@ class HybridRetriever:
                 
                 # 应用 scope_hint 加权
                 if scope_hint:
-                    if scope_hint.heading and parent_heading:
-                        if scope_hint.heading.lower() in parent_heading.lower():
+                    heading = None
+                    if isinstance(scope_hint, dict):
+                        heading = scope_hint.get("heading")
+                    else:
+                        heading = getattr(scope_hint, "heading", None)
+                    
+                    if heading and parent_heading:
+                        if heading.lower() in parent_heading.lower():
                             score += 0.3
                     
-                    if scope_hint.keywords:
-                        for keyword in scope_hint.keywords:
-                            if normalize_text(keyword) in normalize_text(row.plain_text):
-                                score += 0.2
+                    keywords = []
+                    if isinstance(scope_hint, dict):
+                        keywords = scope_hint.get("keywords", [])
+                    else:
+                        keywords = getattr(scope_hint, "keywords", [])
+                    
+                    for keyword in keywords:
+                        if normalize_text(keyword) in normalize_text(row.plain_text):
+                            score += 0.2
                 
                 candidates.append(BlockCandidate(
                     block_id=str(row.block_id),
@@ -231,8 +231,14 @@ class HybridRetriever:
         # 构建过滤器
         filters = {}
         if scope_hint:
-            if scope_hint.block_type:
-                filters['block_type'] = scope_hint.block_type
+            block_type = None
+            if isinstance(scope_hint, dict):
+                block_type = scope_hint.get("block_type")
+            else:
+                block_type = getattr(scope_hint, "block_type", None)
+            
+            if block_type:
+                filters['block_type'] = block_type
         
         # 搜索
         results = self.indexer.search(query, doc_id, rev_id, filters, top_k * 2)
@@ -244,13 +250,25 @@ class HybridRetriever:
             score = 1.0 / (results.index(result) + 1)
             
             # 如果有 heading 提示，增加权重
-            if scope_hint and scope_hint.heading:
-                if scope_hint.heading.lower() in result.get('parent_heading_text', '').lower():
+            if scope_hint:
+                heading = None
+                if isinstance(scope_hint, dict):
+                    heading = scope_hint.get("heading")
+                else:
+                    heading = getattr(scope_hint, "heading", None)
+                
+                if heading and heading.lower() in result.get('parent_heading_text', '').lower():
                     score += 0.3
             
             # 如果有关键词提示，检查是否包含
-            if scope_hint and scope_hint.keywords:
-                for keyword in scope_hint.keywords:
+            if scope_hint:
+                keywords = []
+                if isinstance(scope_hint, dict):
+                    keywords = scope_hint.get("keywords", [])
+                else:
+                    keywords = getattr(scope_hint, "keywords", [])
+                
+                for keyword in keywords:
                     if normalize_text(keyword) in normalize_text(result.get('plain_text', '')):
                         score += 0.2
             
@@ -287,9 +305,15 @@ class HybridRetriever:
         
         # 应用 scope_hint 过滤
         if scope_hint:
-            if scope_hint.block_type:
+            block_type = None
+            if isinstance(scope_hint, dict):
+                block_type = scope_hint.get("block_type")
+            else:
+                block_type = getattr(scope_hint, "block_type", None)
+            
+            if block_type:
                 blocks_query = blocks_query.filter(
-                    db_models.BlockVersion.block_type == scope_hint.block_type
+                    db_models.BlockVersion.block_type == block_type
                 )
         
         blocks = blocks_query.order_by(db_models.BlockVersion.order_index).all()
@@ -309,15 +333,28 @@ class HybridRetriever:
             score = overlap / max(len(query_keywords), 1)
             
             # 如果有 heading 提示，增加权重
-            if scope_hint and scope_hint.heading:
-                # 获取父级 heading
-                parent_heading = self._get_parent_heading(block)
-                if parent_heading and scope_hint.heading.lower() in parent_heading.lower():
-                    score += 0.3
+            if scope_hint:
+                heading = None
+                if isinstance(scope_hint, dict):
+                    heading = scope_hint.get("heading")
+                else:
+                    heading = getattr(scope_hint, "heading", None)
+                
+                if heading:
+                    # 获取父级 heading
+                    parent_heading = self._get_parent_heading(block)
+                    if parent_heading and heading.lower() in parent_heading.lower():
+                        score += 0.3
             
             # 如果有关键词提示，检查是否包含
-            if scope_hint and scope_hint.keywords:
-                for keyword in scope_hint.keywords:
+            if scope_hint:
+                keywords = []
+                if isinstance(scope_hint, dict):
+                    keywords = scope_hint.get("keywords", [])
+                else:
+                    keywords = getattr(scope_hint, "keywords", [])
+                
+                for keyword in keywords:
                     if normalize_text(keyword) in block_normalized:
                         score += 0.2
             

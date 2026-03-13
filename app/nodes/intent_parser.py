@@ -69,7 +69,8 @@ class IntentParserNode:
                 operation=intent_data.get("operation", "replace"),
                 scope_hint=ScopeHint(**intent_data.get("scope_hint", {})),
                 constraints=Constraints(**intent_data.get("constraints", {})),
-                risk=intent_data.get("risk", "low")
+                risk=intent_data.get("risk", "low"),
+                user_message=user_message  # 保存原始消息
             )
             
             state["intent"] = intent
@@ -107,5 +108,6 @@ class IntentParserNode:
             operation=operation,
             scope_hint=ScopeHint(keywords=keywords[:5]),
             constraints=Constraints(),
-            risk=risk
+            risk=risk,
+            user_message=message  # 保存原始消息
         )

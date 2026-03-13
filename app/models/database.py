@@ -87,6 +87,10 @@ class BlockVersion(Base):
     plain_text = Column(Text)
     content_hash = Column(Text, nullable=False)
     
+    # 向量 embedding 字段 (Qwen text-embedding-v3 是 1024 维)
+    from pgvector.sqlalchemy import Vector
+    embedding = Column(Vector(1024))
+    
     parent_version_id = Column(UUID(as_uuid=True), ForeignKey('block_versions.block_version_id'))
     
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

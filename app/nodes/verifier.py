@@ -4,6 +4,7 @@ from app.models.schemas import TargetSelection, TargetBlock, EvidenceQuote, Bloc
 from app.models import database as db_models
 from app.services.llm_client import get_qwen_client
 from app.utils.markdown import normalize_text
+from app.utils.intent_helper import get_intent_attr
 import json
 import uuid
 
@@ -126,9 +127,15 @@ class VerifierNode:
             for i, c in enumerate(candidates[:5])
         ])
         
+        # 安全地将 intent 转换为 JSON
+        if isinstance(intent, dict):
+            intent_json = json.dumps(intent, indent=2, ensure_ascii=False)
+        else:
+            intent_json = intent.model_dump_json(indent=2)
+        
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"用户意图：\n{intent.model_dump_json(indent=2)}\n\n候选段落：\n{candidates_text}\n\n输出 JSON："}
+            {"role": "user", "content": f"用户意图：\n{intent_json}\n\n候选段落：\n{candidates_text}\n\n输出 JSON："}
         ]
         
         try:

@@ -18,7 +18,16 @@ class ApplyEditsNode:
         """应用编辑"""
         edit_plan = state.get("edit_plan")
         if not edit_plan:
-            state["error"] = ErrorInfo(code="no_edit_plan", message="没有编辑计划")
+            state["errors"] = state.get("errors", []) + [{"type": "no_edit_plan", "message": "没有编辑计划"}]
+            return state
+        
+        # 如果 edit_plan 是 Pydantic 模型，转换为字典
+        if hasattr(edit_plan, 'model_dump'):
+            edit_plan_dict = edit_plan.model_dump()
+        elif isinstance(edit_plan, dict):
+            edit_plan_dict = edit_plan
+        else:
+            state["errors"] = state.get("errors", []) + [{"type": "invalid_edit_plan", "message": "编辑计划格式错误"}]
             return state
         
         doc_id = uuid.UUID(state["doc_id"])
@@ -32,13 +41,14 @@ class ApplyEditsNode:
             ).order_by(db_models.BlockVersion.order_index).all()
             
             # 2. 校验所有 operations
-            for op in edit_plan.operations:
-                self._validate_operation(current_blocks, op)
+            operations = edit_plan_dict.get("operations", [])
+            for op_dict in operations:
+                self._validate_operation(current_blocks, op_dict)
             
             # 3. 执行变更
             new_blocks, changed_block_ids = self._apply_operations(
                 current_blocks,
-                edit_plan.operations,
+                operations,
                 doc_id
             )
             
@@ -50,7 +60,7 @@ class ApplyEditsNode:
                 rev_no=new_rev_no,
                 parent_rev_id=active_rev_id,
                 created_by="ai",
-                change_summary=self._generate_summary(edit_plan.operations)
+                change_summary=self._generate_summary(operations)
             )
             self.db.add(new_rev)
             self.db.flush()
@@ -61,19 +71,20 @@ class ApplyEditsNode:
                 self.db.add(block)
             
             # 6. 写入 edit_operations（审计）
-            for op in edit_plan.operations:
+            for op_dict in operations:
+                evidence = op_dict.get("evidence", {})
                 edit_op = db_models.EditOperation(
                     op_id=uuid.uuid4(),
                     doc_id=doc_id,
                     rev_id=new_rev.rev_id,
                     parent_rev_id=active_rev_id,
                     user_id=uuid.UUID(state["user_id"]),
-                    op_type=op.op_type,
-                    target_block_id=uuid.UUID(op.target_block_id),
-                    evidence_quote=op.evidence.text,
-                    quote_start=op.evidence.start,
-                    quote_end=op.evidence.end,
-                    rationale=op.rationale,
+                    op_type=op_dict.get("op_type"),
+                    target_block_id=uuid.UUID(op_dict.get("target_block_id")),
+                    evidence_quote=evidence.get("text", ""),
+                    quote_start=evidence.get("start", 0),
+                    quote_end=evidence.get("end", 0),
+                    rationale=op_dict.get("rationale", ""),
                     status="applied"
                 )
                 self.db.add(edit_op)
@@ -121,36 +132,44 @@ class ApplyEditsNode:
                 new_rev_no=new_rev_no,
                 new_version=new_version,
                 op_ids=[]  # 简化：不返回 op_ids
-            )
+            ).model_dump()  # 转换为字典
+            
+            # 同时设置 new_rev_id 到状态中
+            state["new_rev_id"] = str(new_rev.rev_id)
             
             return state
             
         except IntegrityError as e:
             self.db.rollback()
-            state["error"] = ErrorInfo(code="concurrent_edit", message="文档已被他人修改")
+            state["errors"] = state.get("errors", []) + [{"type": "concurrent_edit", "message": "文档已被他人修改"}]
             state["retry_count"] = state.get("retry_count", 0) + 1
             return state
             
         except Exception as e:
             self.db.rollback()
-            state["error"] = ErrorInfo(code="apply_failed", message=str(e))
+            state["errors"] = state.get("errors", []) + [{"type": "apply_failed", "message": str(e)}]
             return state
     
-    def _validate_operation(self, blocks: List[db_models.BlockVersion], op):
+    def _validate_operation(self, blocks: List[db_models.BlockVersion], op_dict):
         """验证操作"""
         # 查找目标块
         target_block = None
+        target_block_id = op_dict.get("target_block_id") if isinstance(op_dict, dict) else op_dict.target_block_id
+        
         for block in blocks:
-            if str(block.block_id) == op.target_block_id:
+            if str(block.block_id) == target_block_id:
                 target_block = block
                 break
         
         if not target_block:
-            raise ValueError(f"target_block_not_found: {op.target_block_id}")
+            raise ValueError(f"target_block_not_found: {target_block_id}")
         
         # 验证 evidence_quote（简化版）
-        if op.evidence.text not in target_block.plain_text:
-            raise ValueError(f"evidence_quote_not_matched: {op.evidence.text}")
+        evidence = op_dict.get("evidence", {}) if isinstance(op_dict, dict) else op_dict.evidence
+        evidence_text = evidence.get("text", "") if isinstance(evidence, dict) else evidence.text
+        
+        if evidence_text and evidence_text not in target_block.plain_text:
+            raise ValueError(f"evidence_quote_not_matched: {evidence_text}")
     
     def _apply_operations(
         self,
@@ -161,7 +180,14 @@ class ApplyEditsNode:
         """应用操作"""
         new_blocks = []
         changed_block_ids = set()
-        op_map = {op.target_block_id: op for op in operations}
+        
+        # 构建操作映射
+        op_map = {}
+        for op in operations:
+            if isinstance(op, dict):
+                op_map[op.get("target_block_id")] = op
+            else:
+                op_map[op.target_block_id] = op
         
         for block in current_blocks:
             op = op_map.get(str(block.block_id))
@@ -169,7 +195,15 @@ class ApplyEditsNode:
             if op:
                 changed_block_ids.add(block.block_id)
                 
-                if op.op_type == "replace":
+                # 提取操作信息
+                if isinstance(op, dict):
+                    op_type = op.get("op_type")
+                    new_content_md = op.get("new_content_md")
+                else:
+                    op_type = op.op_type
+                    new_content_md = op.new_content_md
+                
+                if op_type == "replace":
                     new_block = db_models.BlockVersion(
                         block_version_id=uuid.uuid4(),
                         block_id=block.block_id,
@@ -178,14 +212,14 @@ class ApplyEditsNode:
                         block_type=block.block_type,
                         heading_level=block.heading_level,
                         parent_heading_block_id=block.parent_heading_block_id,
-                        content_md=op.new_content_md,
-                        plain_text=strip_markdown(op.new_content_md),
-                        content_hash=hash_content(op.new_content_md),
+                        content_md=new_content_md,
+                        plain_text=strip_markdown(new_content_md),
+                        content_hash=hash_content(new_content_md),
                         parent_version_id=None
                     )
                     new_blocks.append(new_block)
                 
-                elif op.op_type == "delete":
+                elif op_type == "delete":
                     # 标记软删除
                     from sqlalchemy import text
                     self.db.execute(
@@ -199,7 +233,7 @@ class ApplyEditsNode:
                     # 不添加到 new_blocks
                     continue
                 
-                elif op.op_type == "insert_after":
+                elif op_type == "insert_after":
                     # 先添加原块
                     new_blocks.append(self._copy_block(block))
                     # 创建新块
@@ -207,7 +241,7 @@ class ApplyEditsNode:
                     new_blocks.append(new_block)
                     changed_block_ids.add(new_block.block_id)
                 
-                elif op.op_type == "insert_before":
+                elif op_type == "insert_before":
                     # 先添加新块
                     new_block = self._create_new_block(op, doc_id, block)
                     new_blocks.append(new_block)
@@ -244,6 +278,12 @@ class ApplyEditsNode:
         """创建新块"""
         new_block_id = uuid.uuid4()
         
+        # 提取新内容
+        if isinstance(op, dict):
+            new_content_md = op.get("new_content_md")
+        else:
+            new_content_md = op.new_content_md
+        
         # 创建 blocks 记录
         block = db_models.Block(
             block_id=new_block_id,
@@ -261,9 +301,9 @@ class ApplyEditsNode:
             block_type="paragraph",
             heading_level=None,
             parent_heading_block_id=context_block.parent_heading_block_id,
-            content_md=op.new_content_md,
-            plain_text=strip_markdown(op.new_content_md),
-            content_hash=hash_content(op.new_content_md),
+            content_md=new_content_md,
+            plain_text=strip_markdown(new_content_md),
+            content_hash=hash_content(new_content_md),
             parent_version_id=None
         )
     
@@ -279,7 +319,8 @@ class ApplyEditsNode:
         """生成变更摘要"""
         op_counts = {}
         for op in operations:
-            op_counts[op.op_type] = op_counts.get(op.op_type, 0) + 1
+            op_type = op.get("op_type") if isinstance(op, dict) else op.op_type
+            op_counts[op_type] = op_counts.get(op_type, 0) + 1
         
         parts = []
         if op_counts.get("replace"):
