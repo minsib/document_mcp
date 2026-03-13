@@ -40,6 +40,13 @@ edits_failed = Counter(
     ['operation_type', 'error_type']
 )
 
+edit_request_duration = Histogram(
+    'edit_request_duration_seconds',
+    'End-to-end edit workflow duration in seconds',
+    ['operation_type', 'status'],
+    buckets=[0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
+)
+
 # 批量修改
 bulk_edits_requested = Counter(
     'bulk_edits_requested_total',
@@ -61,13 +68,26 @@ bulk_changes_count = Histogram(
 searches_performed = Counter(
     'searches_performed_total',
     'Total number of searches performed',
-    ['search_type']  # bm25, vector, hybrid
+    ['search_type', 'status']  # hybrid, meilisearch, simple ; success, empty, error
 )
 
 search_results_count = Histogram(
     'search_results_count',
     'Number of search results returned',
     buckets=[0, 1, 5, 10, 20, 50]
+)
+
+retrieval_duration = Histogram(
+    'retrieval_duration_seconds',
+    'End-to-end retrieval duration in seconds',
+    ['mode'],
+    buckets=[0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0]
+)
+
+retrieval_requests = Counter(
+    'retrieval_requests_total',
+    'Total number of retrieval requests',
+    ['mode', 'status']  # success, empty, error
 )
 
 # 认证操作
@@ -156,6 +176,19 @@ vector_search_duration = Histogram(
 
 # 应用信息
 app_info = Info('app', 'Application information')
+
+workflow_duration = Histogram(
+    'workflow_duration_seconds',
+    'Workflow execution duration in seconds',
+    ['workflow', 'status'],
+    buckets=[0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
+)
+
+workflow_runs_total = Counter(
+    'workflow_runs_total',
+    'Total number of workflow runs',
+    ['workflow', 'status']  # success, error
+)
 
 # 活跃用户
 active_users = Gauge(

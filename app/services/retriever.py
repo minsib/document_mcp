@@ -7,6 +7,15 @@ from app.utils.markdown import normalize_text
 from app.utils.intent_helper import get_intent_attr
 from app.services.search_indexer import get_indexer
 from app.services.embedding import get_embedding_service
+from app.monitoring.metrics import (
+    meilisearch_query_duration,
+    retrieval_duration,
+    retrieval_requests,
+    search_results_count,
+    searches_performed,
+    vector_search_duration,
+)
+import time
 import uuid
 
 
@@ -48,14 +57,22 @@ class HybridRetriever:
         混合检索（BM25 + 向量 + RRF 融合）
         优先使用混合检索，失败则降级
         """
+        search_start = time.time()
+
         # 尝试混合检索（BM25 + 向量）
         if self.use_meilisearch and self.use_vector and self.indexer and self.embedding_service:
             try:
                 results = self._hybrid_search(query, doc_id, rev_id, scope_hint, top_k)
                 if results:
+                    searches_performed.labels(search_type="hybrid", status="success").inc()
+                    search_results_count.observe(len(results))
+                    retrieval_duration.labels(mode="hybrid").observe(time.time() - search_start)
+                    retrieval_requests.labels(mode="hybrid", status="success").inc()
                     return results
+                searches_performed.labels(search_type="hybrid", status="empty").inc()
                 print("混合检索返回空结果，尝试 Meilisearch 搜索")
             except Exception as e:
+                searches_performed.labels(search_type="hybrid", status="error").inc()
                 print(f"混合检索失败: {e}")
         
         # 降级到 Meilisearch
@@ -63,13 +80,31 @@ class HybridRetriever:
             try:
                 results = self._meilisearch_search(query, doc_id, rev_id, scope_hint, top_k)
                 if results:
+                    searches_performed.labels(search_type="meilisearch", status="success").inc()
+                    search_results_count.observe(len(results))
+                    retrieval_duration.labels(mode="meilisearch").observe(time.time() - search_start)
+                    retrieval_requests.labels(mode="meilisearch", status="success").inc()
                     return results
+                searches_performed.labels(search_type="meilisearch", status="empty").inc()
                 print("Meilisearch 返回空结果，尝试简单搜索")
             except Exception as e:
+                searches_performed.labels(search_type="meilisearch", status="error").inc()
                 print(f"Meilisearch 搜索失败，降级到简单匹配: {e}")
         
         # 最终降级到简单搜索
-        return self._simple_search(query, doc_id, rev_id, scope_hint, top_k)
+        try:
+            results = self._simple_search(query, doc_id, rev_id, scope_hint, top_k)
+            final_status = "success" if results else "empty"
+            searches_performed.labels(search_type="simple", status=final_status).inc()
+            search_results_count.observe(len(results))
+            retrieval_duration.labels(mode="simple").observe(time.time() - search_start)
+            retrieval_requests.labels(mode="simple", status=final_status).inc()
+            return results
+        except Exception:
+            searches_performed.labels(search_type="simple", status="error").inc()
+            retrieval_duration.labels(mode="simple").observe(time.time() - search_start)
+            retrieval_requests.labels(mode="simple", status="error").inc()
+            return []
     
     def _hybrid_search(
         self,
@@ -103,6 +138,7 @@ class HybridRetriever:
         top_k: int
     ) -> List[BlockCandidate]:
         """向量相似度搜索"""
+        start_time = time.time()
         try:
             # 生成查询向量
             query_embedding = self.embedding_service.generate_embedding(query)
@@ -175,6 +211,8 @@ class HybridRetriever:
         except Exception as e:
             print(f"向量检索失败: {e}")
             return []
+        finally:
+            vector_search_duration.observe(time.time() - start_time)
     
     def _reciprocal_rank_fusion(
         self,
@@ -228,64 +266,67 @@ class HybridRetriever:
         top_k: int
     ) -> List[BlockCandidate]:
         """使用 Meilisearch 搜索"""
-        # 构建过滤器
-        filters = {}
-        if scope_hint:
-            block_type = None
-            if isinstance(scope_hint, dict):
-                block_type = scope_hint.get("block_type")
-            else:
-                block_type = getattr(scope_hint, "block_type", None)
-            
-            if block_type:
-                filters['block_type'] = block_type
-        
-        # 搜索
-        results = self.indexer.search(query, doc_id, rev_id, filters, top_k * 2)
-        
-        # 转换为 BlockCandidate
-        candidates = []
-        for result in results:
-            # 计算分数（Meilisearch 不直接返回分数，使用排名）
-            score = 1.0 / (results.index(result) + 1)
-            
-            # 如果有 heading 提示，增加权重
+        start_time = time.time()
+        try:
+            # 构建过滤器
+            filters = {}
             if scope_hint:
-                heading = None
+                block_type = None
                 if isinstance(scope_hint, dict):
-                    heading = scope_hint.get("heading")
+                    block_type = scope_hint.get("block_type")
                 else:
-                    heading = getattr(scope_hint, "heading", None)
+                    block_type = getattr(scope_hint, "block_type", None)
                 
-                if heading and heading.lower() in result.get('parent_heading_text', '').lower():
-                    score += 0.3
+                if block_type:
+                    filters['block_type'] = block_type
             
-            # 如果有关键词提示，检查是否包含
-            if scope_hint:
-                keywords = []
-                if isinstance(scope_hint, dict):
-                    keywords = scope_hint.get("keywords", [])
-                else:
-                    keywords = getattr(scope_hint, "keywords", [])
+            # 搜索
+            results = self.indexer.search(query, doc_id, rev_id, filters, top_k * 2)
+            
+            # 转换为 BlockCandidate
+            candidates = []
+            for result in results:
+                # 计算分数（Meilisearch 不直接返回分数，使用排名）
+                score = 1.0 / (results.index(result) + 1)
                 
-                for keyword in keywords:
-                    if normalize_text(keyword) in normalize_text(result.get('plain_text', '')):
-                        score += 0.2
+                # 如果有 heading 提示，增加权重
+                if scope_hint:
+                    heading = None
+                    if isinstance(scope_hint, dict):
+                        heading = scope_hint.get("heading")
+                    else:
+                        heading = getattr(scope_hint, "heading", None)
+                    
+                    if heading and heading.lower() in result.get('parent_heading_text', '').lower():
+                        score += 0.3
+                
+                # 如果有关键词提示，检查是否包含
+                if scope_hint:
+                    keywords = []
+                    if isinstance(scope_hint, dict):
+                        keywords = scope_hint.get("keywords", [])
+                    else:
+                        keywords = getattr(scope_hint, "keywords", [])
+                    
+                    for keyword in keywords:
+                        if normalize_text(keyword) in normalize_text(result.get('plain_text', '')):
+                            score += 0.2
+                
+                candidates.append(BlockCandidate(
+                    block_id=result['block_id'],
+                    snippet=result.get('plain_text', '')[:200],
+                    heading_context=result.get('parent_heading_text', '（无标题）'),
+                    order_index=result.get('order_index', 0),
+                    score=min(score, 1.0),
+                    block_type=result.get('block_type', 'paragraph')
+                ))
             
-            candidates.append(BlockCandidate(
-                block_id=result['block_id'],
-                snippet=result.get('plain_text', '')[:200],
-                heading_context=result.get('parent_heading_text', '（无标题）'),
-                order_index=result.get('order_index', 0),
-                score=min(score, 1.0),
-                block_type=result.get('block_type', 'paragraph')
-            ))
-        
-        # 按分数排序
-        candidates.sort(key=lambda x: x.score, reverse=True)
-        
-        return candidates[:top_k]
-    
+            # 按分数排序
+            candidates.sort(key=lambda x: x.score, reverse=True)
+            return candidates[:top_k]
+        finally:
+            meilisearch_query_duration.observe(time.time() - start_time)
+
     def _simple_search(
         self,
         query: str,

@@ -1,6 +1,7 @@
 from openai import OpenAI
 from typing import Optional, Dict, Any
 from app.config import get_settings
+from app.monitoring.metrics import llm_call_duration, llm_calls_total, llm_tokens_used
 import time
 import logging
 
@@ -40,8 +41,9 @@ class QwenClient:
         if response_format:
             kwargs["response_format"] = response_format
         
-        # 记录开始时间
+        operation = span_name or ("chat_completion_json" if response_format else "chat_completion")
         start_time = time.time()
+        status = "success"
         
         try:
             response = self.client.chat.completions.create(**kwargs)
@@ -49,6 +51,15 @@ class QwenClient:
             
             # 计算耗时
             duration = time.time() - start_time
+
+            # 记录 token 使用
+            if response.usage:
+                llm_tokens_used.labels(model=self.model, token_type="prompt").inc(
+                    response.usage.prompt_tokens or 0
+                )
+                llm_tokens_used.labels(model=self.model, token_type="completion").inc(
+                    response.usage.completion_tokens or 0
+                )
             
             # 记录到 Langfuse
             if trace_id and settings.ENABLE_LANGFUSE:
@@ -80,8 +91,13 @@ class QwenClient:
             return content
             
         except Exception as e:
+            status = "error"
             logger.error(f"LLM API 调用失败: {e}")
             raise
+        finally:
+            duration = time.time() - start_time
+            llm_call_duration.labels(model=self.model, operation=operation).observe(duration)
+            llm_calls_total.labels(model=self.model, operation=operation, status=status).inc()
     
     def chat_completion_json(
         self,

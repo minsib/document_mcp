@@ -9,6 +9,15 @@ from app.nodes.apply import ApplyEditsNode
 from app.services.retriever import HybridRetriever
 from app.models.schemas import ChatEditResponse, CandidateResponse
 from app.models import database as db_models
+from app.monitoring.metrics import (
+    edit_request_duration,
+    edits_applied,
+    edits_failed,
+    edits_requested,
+    workflow_duration,
+    workflow_runs_total,
+)
+import time
 import uuid
 
 
@@ -45,6 +54,21 @@ class EditWorkflow:
         user_selection: Optional[str] = None
     ) -> ChatEditResponse:
         """执行编辑工作流（集成 Langfuse 追踪）"""
+        workflow_name = "edit_workflow"
+        started_at = time.time()
+        operation_type = "unknown"
+        terminal_status = "failed"
+        request_recorded = False
+
+        def ensure_edit_request_recorded() -> None:
+            nonlocal request_recorded
+            if not request_recorded:
+                edits_requested.labels(operation_type=operation_type).inc()
+                request_recorded = True
+
+        def record_edit_failed(error_type: str) -> None:
+            ensure_edit_request_recorded()
+            edits_failed.labels(operation_type=operation_type, error_type=error_type).inc()
         
         # 创建 Langfuse Trace
         trace = None
@@ -73,6 +97,21 @@ class EditWorkflow:
         ).first()
         
         if not active_rev:
+            record_edit_failed("doc_not_found")
+            terminal_status = "failed"
+            elapsed = time.time() - started_at
+            edit_request_duration.labels(
+                operation_type=operation_type,
+                status=terminal_status
+            ).observe(elapsed)
+            workflow_duration.labels(workflow=workflow_name, status="error").observe(elapsed)
+            workflow_runs_total.labels(workflow=workflow_name, status="error").inc()
+            if trace:
+                try:
+                    from app.services.langfuse_client import flush
+                    flush()
+                except:
+                    pass
             return ChatEditResponse(
                 status="failed",
                 message="文档不存在",
@@ -96,13 +135,18 @@ class EditWorkflow:
         try:
             # 1. 解析意图
             state = self.intent_parser(state)
+            operation_type = self._extract_operation_type(state)
+            ensure_edit_request_recorded()
             if state.get("error"):
+                record_edit_failed(self._extract_error_type(state.get("error"), "intent_parse_error"))
+                terminal_status = "failed"
                 return self._handle_error(state)
             
             # 1.5 意图澄清检查
             state = self.intent_clarifier(state)
             if state.get("needs_clarification"):
                 clarification = state["clarification"]
+                terminal_status = "need_clarification"
                 return ChatEditResponse(
                     status="need_clarification",
                     message=clarification["message"],
@@ -133,6 +177,8 @@ class EditWorkflow:
             state["candidates"] = candidates
             
             if not candidates:
+                record_edit_failed("no_candidates")
+                terminal_status = "failed"
                 return ChatEditResponse(
                     status="failed",
                     message="未找到匹配的内容，请提供更具体的描述",
@@ -144,6 +190,7 @@ class EditWorkflow:
             selection = state.get("selection")
             
             if selection and selection.need_user_disambiguation:
+                terminal_status = "need_disambiguation"
                 return ChatEditResponse(
                     status="need_disambiguation",
                     candidates=[
@@ -159,6 +206,8 @@ class EditWorkflow:
                 )
             
             if not selection or not selection.targets:
+                record_edit_failed("no_target")
+                terminal_status = "failed"
                 return ChatEditResponse(
                     status="failed",
                     message="无法定位目标内容",
@@ -168,11 +217,15 @@ class EditWorkflow:
             # 4. 生成编辑计划
             state = self.planner(state)
             if state.get("error"):
+                record_edit_failed(self._extract_error_type(state.get("error"), "planner_error"))
+                terminal_status = "failed"
                 return self._handle_error(state)
             
             # 5. 生成预览
             state = self.preview_generator(state)
             if state.get("error"):
+                record_edit_failed(self._extract_error_type(state.get("error"), "preview_error"))
+                terminal_status = "failed"
                 return self._handle_error(state)
             
             # 6. 判断是否需要确认
@@ -189,6 +242,7 @@ class EditWorkflow:
                     if warning_msgs:
                         message += "\n\n" + "\n".join(warning_msgs)
                 
+                terminal_status = "need_confirm"
                 return ChatEditResponse(
                     status="need_confirm",
                     preview=state["preview_diff"],
@@ -200,10 +254,14 @@ class EditWorkflow:
             # 7. 直接应用（低风险操作）
             state = self.apply_node(state)
             if state.get("error"):
+                record_edit_failed(self._extract_error_type(state.get("error"), "apply_error"))
+                terminal_status = "failed"
                 return self._handle_error(state)
             
             # 8. 导出文档
             export_md = self._export_document(state["apply_result"].new_rev_id)
+            edits_applied.labels(operation_type=operation_type).inc()
+            terminal_status = "applied"
             
             return ChatEditResponse(
                 status="applied",
@@ -224,12 +282,26 @@ class EditWorkflow:
                 except:
                     pass
             
+            record_edit_failed("workflow_error")
+            terminal_status = "failed"
             return ChatEditResponse(
                 status="failed",
                 message=f"处理失败: {str(e)}",
                 error={"code": "workflow_error", "message": str(e)}
             )
         finally:
+            ensure_edit_request_recorded()
+            elapsed = time.time() - started_at
+            edit_request_duration.labels(
+                operation_type=operation_type,
+                status=terminal_status
+            ).observe(elapsed)
+            workflow_status = "success" if terminal_status in {
+                "applied", "need_confirm", "need_disambiguation", "need_clarification"
+            } else "error"
+            workflow_duration.labels(workflow=workflow_name, status=workflow_status).observe(elapsed)
+            workflow_runs_total.labels(workflow=workflow_name, status=workflow_status).inc()
+
             # 刷新 Langfuse 缓冲区
             if trace:
                 try:
@@ -260,6 +332,23 @@ class EditWorkflow:
                 message=str(error) if error else "处理失败",
                 error={"code": "unknown_error", "message": str(error) if error else "未知错误"}
             )
+
+    def _extract_operation_type(self, state: Dict[str, Any]) -> str:
+        """从状态中提取编辑操作类型"""
+        intent = state.get("intent")
+        if not intent:
+            return "unknown"
+        if isinstance(intent, dict):
+            return intent.get("operation", "unknown")
+        return getattr(intent, "operation", "unknown")
+
+    def _extract_error_type(self, error: Any, fallback: str) -> str:
+        """从错误对象中提取稳定的错误类型"""
+        if isinstance(error, dict):
+            return error.get("code") or fallback
+        if hasattr(error, "code"):
+            return getattr(error, "code") or fallback
+        return fallback
     
     def _export_document(self, rev_id: str) -> str:
         """导出文档"""
@@ -269,4 +358,3 @@ class EditWorkflow:
         
         markdown_parts = [block.content_md for block in blocks]
         return '\n\n'.join(markdown_parts)
-from app.models import database as db_models

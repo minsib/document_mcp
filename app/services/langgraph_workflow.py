@@ -4,6 +4,8 @@ LangGraph 工作流 - 基于 LangGraph 的文档编辑工作流
 from typing import Dict, Any, TypedDict, Literal, Optional, List
 from langgraph.graph import StateGraph, END
 from sqlalchemy.orm import Session
+from app.monitoring.metrics import workflow_duration, workflow_runs_total
+import time
 
 from app.agents.retrieval_agent import create_retrieval_agent
 from app.models.schemas import Intent
@@ -265,6 +267,8 @@ class LangGraphWorkflowExecutor:
         user_selection: Optional[str] = None
     ) -> Dict[str, Any]:
         """执行工作流"""
+        started_at = time.time()
+        terminal_status = "failed"
         from app.models import database as db_models
         import uuid
         
@@ -276,6 +280,16 @@ class LangGraphWorkflowExecutor:
         ).first()
         
         if not active_rev:
+            terminal_status = "failed"
+            elapsed = time.time() - started_at
+            workflow_duration.labels(
+                workflow="langgraph_edit_workflow",
+                status="error"
+            ).observe(elapsed)
+            workflow_runs_total.labels(
+                workflow="langgraph_edit_workflow",
+                status="error"
+            ).inc()
             return {
                 "status": "failed",
                 "message": "文档不存在",
@@ -320,12 +334,16 @@ class LangGraphWorkflowExecutor:
             print(f"DEBUG: Workflow completed, result keys: {result.keys() if isinstance(result, dict) else 'not a dict'}")
             
             # 格式化返回结果
-            return self._format_response(result)
+            response = self._format_response(result)
+            if isinstance(response, dict):
+                terminal_status = response.get("status", "failed")
+            return response
             
         except KeyError as e:
             import traceback
             error_detail = traceback.format_exc()
             print(f"工作流执行失败 (KeyError): {error_detail}")
+            terminal_status = "failed"
             return {
                 "status": "failed",
                 "message": f"工作流执行失败: {str(e)}",
@@ -335,11 +353,25 @@ class LangGraphWorkflowExecutor:
             import traceback
             error_detail = traceback.format_exc()
             print(f"工作流执行失败: {error_detail}")
+            terminal_status = "failed"
             return {
                 "status": "failed",
                 "message": f"工作流执行失败: {str(e)}",
                 "error": {"code": "workflow_error", "message": str(e), "detail": error_detail}
             }
+        finally:
+            elapsed = time.time() - started_at
+            workflow_status = "success" if terminal_status in {
+                "applied", "need_confirm", "need_disambiguation", "need_clarification"
+            } else "error"
+            workflow_duration.labels(
+                workflow="langgraph_edit_workflow",
+                status=workflow_status
+            ).observe(elapsed)
+            workflow_runs_total.labels(
+                workflow="langgraph_edit_workflow",
+                status=workflow_status
+            ).inc()
     
     def _format_response(self, state: WorkflowState) -> Dict[str, Any]:
         """格式化响应"""

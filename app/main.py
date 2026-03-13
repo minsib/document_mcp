@@ -264,6 +264,7 @@ async def confirm_edit(
     from app.models.schemas import EditPlan
     from app.nodes.apply import ApplyEditsNode
     from app.services.cache import get_cache_manager
+    from app.monitoring.metrics import edits_applied, edits_failed
     
     # 模拟用户 ID
     user_id = str(uuid.uuid4())
@@ -373,6 +374,7 @@ async def confirm_edit(
     
     # 8. plan_hash 校验
     edit_plan = EditPlan(**payload["edit_plan"])
+    operation_type = edit_plan.operations[0].op_type if edit_plan.operations else "unknown"
     plan_json = json.dumps(edit_plan.model_dump(), sort_keys=True)
     plan_hash = hashlib.sha256(plan_json.encode()).hexdigest()
     
@@ -403,6 +405,7 @@ async def confirm_edit(
     cache.delete_confirm_token(request.session_id, request.confirm_token)
     
     if result.get("apply_result"):
+        edits_applied.labels(operation_type=operation_type).inc()
         # 导出文档
         from app.services.workflow import EditWorkflow
         workflow = EditWorkflow(db, cache)
@@ -418,6 +421,10 @@ async def confirm_edit(
         error = result.get("error", {})
         if hasattr(error, 'model_dump'):
             error = error.model_dump()
+        edits_failed.labels(
+            operation_type=operation_type,
+            error_type=error.get("code", "apply_failed")
+        ).inc()
         
         return ConfirmResponse(
             status="failed",

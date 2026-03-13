@@ -1,0 +1,112 @@
+{
+  "id": null,
+  "uid": "doc-edit-obsv",
+  "title": "Document Edit Observability",
+  "tags": ["document-edit", "prometheus"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Edit Requests (5m)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(increase(edits_requested_total[5m]))", "legendFormat": "requests"}
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Edit Success Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(edits_applied_total[5m])) / clamp_min(sum(rate(edits_requested_total[5m])), 1e-9)", "legendFormat": "success_rate"}
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Edit Latency P95",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.95, sum(rate(edit_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95"}
+      ]
+    },
+    {
+      "id": 4,
+      "title": "LLM Token Usage (per sec)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(llm_tokens_used_total[5m])) by (model, token_type)", "legendFormat": "{{model}} {{token_type}}"}
+      ]
+    },
+    {
+      "id": 5,
+      "title": "LLM Latency P95",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.95, sum(rate(llm_call_duration_seconds_bucket[5m])) by (le, model, operation))", "legendFormat": "{{model}} {{operation}}"}
+      ]
+    },
+    {
+      "id": 6,
+      "title": "LLM Error Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(llm_calls_total{status=\"error\"}[5m])) / clamp_min(sum(rate(llm_calls_total[5m])), 1e-9)", "legendFormat": "error_rate"}
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Retrieval Latency P95",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.95, sum(rate(retrieval_duration_seconds_bucket[5m])) by (le, mode))", "legendFormat": "{{mode}}"}
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Retrieval Empty Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(retrieval_requests_total{status=\"empty\"}[5m])) / clamp_min(sum(rate(retrieval_requests_total{status=~\"success|empty\"}[5m])), 1e-9)", "legendFormat": "empty_rate"}
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Workflow Duration P95",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.95, sum(rate(workflow_duration_seconds_bucket[5m])) by (le, workflow))", "legendFormat": "{{workflow}}"}
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Workflow Error Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(workflow_runs_total{status=\"error\"}[5m])) / clamp_min(sum(rate(workflow_runs_total[5m])), 1e-9)", "legendFormat": "error_rate"}
+      ]
+    }
+  ]
+}
