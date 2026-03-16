@@ -19,6 +19,7 @@
 - 📊 **完整审计**：所有操作可追溯，支持审计查询
 - 📈 **监控告警**：健康检查 + Prometheus 指标
 - ⚡ **智能降级**：多级降级策略确保系统稳定性
+- 👥 **协同编辑**：基于 Redis + WebSocket 的实时多人协作
 
 ## 技术架构
 
@@ -300,15 +301,103 @@ curl -X POST "http://localhost:8000/v1/docs/550e8400-e29b-41d4-a716-446655440000
   }'
 ```
 
+### 6. 协同编辑（WebSocket）
+
+系统支持基于 Redis + WebSocket 的实时多人协同编辑：
+
+```javascript
+// 建立 WebSocket 连接
+const token = 'YOUR_ACCESS_TOKEN';
+const docId = 'your-document-id';
+const ws = new WebSocket(`ws://localhost:8001/ws/collab/${docId}?token=${token}`);
+
+// 接收消息
+ws.onmessage = (event) => {
+  const message = JSON.parse(event.data);
+  console.log('Received:', message);
+  
+  switch (message.type) {
+    case 'edit':
+      // 其他用户的编辑操作
+      applyEdit(message.data);
+      break;
+    case 'cursor':
+      // 其他用户的光标位置
+      showCursor(message.user_id, message.position);
+      break;
+    case 'user_joined':
+      // 用户加入通知
+      console.log(`${message.username} 加入了文档`);
+      break;
+    case 'user_left':
+      // 用户离开通知
+      console.log(`${message.username} 离开了文档`);
+      break;
+    case 'error':
+      // 编辑冲突等错误
+      console.error(`编辑冲突: ${message.message}`);
+      break;
+  }
+};
+
+// 发送编辑操作
+ws.send(JSON.stringify({
+  type: 'edit',
+  data: {
+    block_id: 'block_123',
+    operation: 'replace',
+    content: '新内容'
+  }
+}));
+
+// 发送光标位置
+ws.send(JSON.stringify({
+  type: 'cursor',
+  position: {
+    block_id: 'block_123',
+    offset: 42
+  }
+}));
+```
+
+**协同编辑特性**：
+- ✅ **实时同步**：编辑操作实时广播给所有在线用户
+- ✅ **编辑锁机制**：块级编辑锁防止编辑冲突
+- ✅ **用户状态管理**：实时显示在线用户列表
+- ✅ **光标同步**：实时同步用户光标位置
+- ✅ **离线同步**：支持离线用户重新连接后同步最新编辑
+- ✅ **数据持久化**：编辑历史存储在 Redis 中
+
+
+
 ## 核心功能详解
 
 ### 1. 智能定位
 
-系统使用三层检索策略确保定位准确：
+系统使用混合检索策略确保定位准确：
 
 - **BM25 检索**：擅长关键词匹配（如"第 3 章"、"交付时间"）
 - **向量检索**：擅长语义理解（如"关于钱的内容" → "付款条款"）
-- **重排模型**：进一步优化排序，提升准确率
+- **RRF 融合算法**：使用 Reciprocal Rank Fusion 算法融合多路检索结果，提升准确率
+
+#### RRF 算法原理
+
+RRF (Reciprocal Rank Fusion) 是一种简单而有效的多路检索结果融合算法：
+
+```
+RRF(d) = Σ 1 / (k + rank(d))
+```
+
+其中：
+- `d` 是文档（块）
+- `k` 是常数（默认 60）
+- `rank(d)` 是文档在各个检索结果列表中的排名
+
+**优势**：
+- 不需要归一化不同检索器的分数
+- 对排名靠前的结果给予更高权重
+- 能够有效融合 BM25 和向量检索的优势
+- 简单高效，无需训练
 
 ### 2. 编辑操作类型
 
@@ -343,33 +432,40 @@ document_mcp/
 │   │   ├── database.py         # SQLAlchemy 模型
 │   │   └── schemas.py          # Pydantic 模型
 │   ├── api/                    # API 路由
-│   ├── auth/                   # 认证模块
-│   ├── services/               # 业务逻辑
-│   │   ├── splitter.py         # 文档分块
-│   │   ├── retriever.py        # 混合检索
-│   │   ├── langgraph_workflow.py  # LangGraph 工作流 ⭐ 新架构
-│   │   └── cache.py            # 缓存管理
-│   ├── agents/                 # 智能体层 ⭐ 新架构
+│   │   └── collaboration.py    # 协同编辑 WebSocket API ✅
+│   ├── auth/                   # 认证模块（JWT + API Key）
+│   ├── services/               # 业务逻辑层
+│   │   ├── splitter.py         # 文档智能分块
+│   │   ├── retriever.py        # 混合检索（BM25 + 向量 + RRF）
+│   │   ├── langgraph_workflow.py  # LangGraph 工作流引擎 ✅
+│   │   ├── collaboration.py    # 协同编辑管理器 ✅
+│   │   ├── cache.py            # 多级缓存管理
+│   │   └── search_indexer.py   # Meilisearch 索引
+│   ├── agents/                 # 智能体层 ✅
 │   │   ├── intent_agent.py     # 意图理解智能体
 │   │   ├── router_agent.py     # 路由决策智能体
 │   │   ├── clarify_agent.py    # 澄清确认智能体
 │   │   ├── retrieval_agent.py  # 检索定位智能体
 │   │   └── edit_agent.py       # 编辑执行智能体
-│   ├── tools/                  # 工具层 ⭐ 新架构
-│   │   ├── db_tools.py         # 数据库工具
+│   ├── tools/                  # 工具层 ✅
+│   │   ├── db_tools.py         # 数据库操作工具
 │   │   ├── search_tools.py     # 检索工具
-│   │   ├── llm_tools.py        # LLM 工具
-│   │   └── index_tools.py      # 索引工具
-│   ├── nodes/                  # 工作流节点（旧架构，待迁移）
-│   ├── monitoring/             # 监控模块
+│   │   ├── llm_tools.py        # LLM 调用工具
+│   │   └── index_tools.py      # 索引管理工具
+│   ├── nodes/                  # 工作流节点（批量编辑等）
+│   ├── monitoring/             # 监控模块（Prometheus）
 │   └── utils/                  # 工具函数
 ├── alembic/                    # 数据库迁移
-├── scripts/                    # 脚本工具
+│   └── versions/               # 迁移脚本
+├── scripts/                    # 运维脚本
+│   ├── test_monitoring.py      # 监控测试脚本
+│   └── generate_monitoring_traffic.sh  # 流量生成
+├── ops/                        # 运维配置
+│   ├── prometheus/             # Prometheus 配置
+│   └── grafana/                # Grafana 配置
 ├── .env.example                # 环境变量示例
 ├── requirements.txt            # Python 依赖
-├── docker-compose.yml          # Docker Compose
-├── REFACTORING_TO_LANGGRAPH.md # 重构规划文档 ⭐
-├── REFACTORING_PROGRESS.md     # 重构进度报告 ⭐
+├── docker-compose.yml          # Docker Compose 编排
 └── README.md                   # 本文件
 ```
 
@@ -443,7 +539,7 @@ python scripts/regenerate_embeddings.py
 psql -h localhost -p 5435 -U postgres -d document_edit -c "SELECT COUNT(*) FROM block_versions WHERE embedding IS NOT NULL;"
 ```
 
-详细说明请参考 [VECTOR_SEARCH_SETUP.md](VECTOR_SEARCH_SETUP.md)
+
 
 ### 生产环境配置
 
@@ -464,6 +560,8 @@ gunicorn app.main:app \
 - **单次编辑延迟**：< 3 秒（P95）
 - **批量修改**：< 5 秒（100 处）
 - **并发支持**：100+ 并发编辑请求
+- **协同编辑延迟**：< 100ms（WebSocket 消息传输）
+- **多用户协作**：支持 10-20 用户同时编辑
 - **可用性**：99.9% SLA
 
 ## 监控与健康检查
@@ -484,7 +582,6 @@ curl http://localhost:8000/health/liveness
 curl http://localhost:8000/health/readiness
 ```
 
-详细说明：[MONITORING_GUIDE.md](MONITORING_GUIDE.md)
 
 ## 监控与告警
 
@@ -546,7 +643,23 @@ A:
 3. 运行 `python3 scripts/create_admin_user.py` 创建管理员
 4. 支持 JWT Token 和 API Key 两种认证方式
 
-详见 [AUTH_GUIDE.md](AUTH_GUIDE.md)
+
+
+### Q: 协同编辑如何防止冲突？
+
+A:
+1. **块级编辑锁**：每个文档块独立加锁，不同用户可同时编辑不同块
+2. **自动超时**：编辑锁 30 秒后自动过期，防止死锁
+3. **冲突提示**：当锁被其他用户持有时，显示冲突提示和锁持有者
+4. **实时同步**：编辑操作实时广播，所有用户看到最新状态
+
+### Q: 协同编辑支持多少用户？
+
+A:
+- **理论上限**：无限制（基于 Redis + WebSocket）
+- **推荐并发**：每个文档 10-20 个用户
+- **性能优化**：编辑事件自动过期，连接自动清理
+- **扩展性**：支持多实例部署，共享 Redis 状态
 
 ## 路线图
 
@@ -558,15 +671,16 @@ A:
 
 ### Phase 2: 体验优化（已完成）
 - ✅ 混合检索（BM25 + 向量）
+- ✅ RRF 融合算法
 - ✅ 批量修改
 - ✅ 用户认证系统
 - ✅ 基础监控
 - ✅ 意图澄清机制
 
-### Phase 3: 架构升级（进行中）⭐
-- 🚧 LangGraph 工作流重构
-- 🚧 智能体架构（Intent/Router/Retrieval/Edit）
-- 🚧 工具层封装
+### Phase 3: 架构升级（已完成）✅
+- ✅ LangGraph 工作流重构
+- ✅ 智能体架构（Intent/Router/Retrieval/Edit/Clarify）
+- ✅ 工具层封装（DB/Search/LLM/Index）
 - ⏳ 流式输出支持
 - ⏳ 完整的 Langfuse 追踪
 
@@ -576,11 +690,18 @@ A:
 - 📋 智能体执行状态展示
 - 📋 流式响应支持
 
+### Phase 4: 协同编辑（已完成）✅
+- ✅ 协同编辑（Redis + WebSocket 实时同步）
+- ✅ 多用户实时协作
+- ✅ 编辑锁机制防冲突
+- ✅ 用户状态管理
+- ✅ 光标位置同步
+
 ### Phase 5: 高级功能（未来）
-- 📋 协同编辑
 - 📋 AI 主动建议
-- 📋 自定义重排模型
+- 📋 深度学习重排模型（Cohere Rerank 或自训练）
 - 📋 多语言支持
+- 📋 操作转换（OT）算法
 
 ## 贡献指南
 

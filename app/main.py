@@ -59,6 +59,10 @@ app.add_middleware(LoggingMiddleware)
 app.include_router(auth_router)
 app.include_router(health_router)
 
+# 导入并注册协同编辑路由
+from app.api.collaboration import router as collab_router
+app.include_router(collab_router, tags=["collaboration"])
+
 # Prometheus metrics endpoint
 metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)

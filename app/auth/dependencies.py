@@ -143,3 +143,50 @@ async def get_optional_user(
 ) -> Optional[User]:
     """获取当前用户（可选，不强制要求认证）"""
     return user_from_token or user_from_api_key
+
+
+
+async def get_current_user_ws(token: str, db: Session) -> User:
+    """
+    WebSocket 认证
+    从 query 参数中的 token 获取用户
+    """
+    payload = decode_token(token)
+    
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+    
+    # 检查 token 类型
+    if payload.get("type") != "access":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token type"
+        )
+    
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload"
+        )
+    
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid user ID"
+        )
+    
+    user = db.query(User).filter(User.user_id == user_uuid).first()
+    
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found or inactive"
+        )
+    
+    return user
