@@ -13,6 +13,7 @@ class IntentParserNode:
     def __call__(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """解析用户意图"""
         user_message = state["user_message"]
+        memory_context = state.get("memory_context", "")
         
         # 构建提示词
         system_prompt = """你是一个文档编辑意图解析助手。
@@ -47,9 +48,13 @@ class IntentParserNode:
 }
 """
         
+        user_content = f"用户消息：{user_message}\n\n输出 JSON："
+        if memory_context:
+            user_content = f"可用记忆上下文：\n{memory_context}\n\n{user_content}"
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"用户消息：{user_message}\n\n输出 JSON："}
+            {"role": "user", "content": user_content}
         ]
         
         # 获取 trace_id

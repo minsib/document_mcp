@@ -6,6 +6,7 @@ from app.services.llm_client import get_qwen_client
 from app.nodes.intent_clarifier import CrossReferenceResolver, SemanticConflictDetector
 import json
 import uuid
+import re
 
 
 class EditPlannerNode:
@@ -19,6 +20,7 @@ class EditPlannerNode:
     
     def __call__(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """生成编辑计划"""
+        memory_context = state.get("memory_context", "")
         # 兼容新的工作流状态结构
         selected_target = state.get("selected_target")
         if not selected_target:
@@ -45,6 +47,18 @@ class EditPlannerNode:
                 operation = self._generate_operation(intent_dict, target, block)
                 operations.append(operation)
             except Exception as e:
+                fallback_operation = self._build_direct_replace_operation(
+                    intent_dict=intent_dict,
+                    block=block,
+                    evidence=EvidenceQuote(
+                        text=block.plain_text[: min(50, len(block.plain_text or ""))],
+                        start=0,
+                        end=min(50, len(block.plain_text or "")),
+                    ) if isinstance(target, dict) else target.evidence,
+                )
+                if fallback_operation is not None:
+                    operations.append(fallback_operation)
+                    continue
                 state["errors"] = state.get("errors", []) + [{"type": "plan_generation_failed", "message": str(e)}]
                 return state
         
@@ -131,6 +145,13 @@ class EditPlannerNode:
 
 evidence_quote：{evidence.text}
 """
+
+        if memory_context:
+            user_content += f"""
+
+可用记忆上下文：
+{memory_context}
+"""
         
         # 如果有引用内容，添加到提示中
         if referenced_content:
@@ -151,7 +172,7 @@ evidence_quote：{evidence.text}
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content + "\n请生成修改后的内容。输出 JSON："}
         ]
-        
+
         response = self.llm.chat_completion_json(messages, temperature=0.7)
         result = json.loads(response)
         
@@ -164,6 +185,59 @@ evidence_quote：{evidence.text}
             evidence=evidence,
             new_content_md=result.get("new_content_md"),
             rationale=result.get("rationale", "")[:200]
+        )
+
+    def _build_direct_replace_operation(
+        self,
+        *,
+        intent_dict: Any,
+        block: db_models.BlockVersion,
+        evidence: EvidenceQuote,
+    ) -> Optional[EditOperation]:
+        """Deterministic fallback for explicit 'replace X with Y' instructions."""
+        operation = intent_dict.get("operation") if isinstance(intent_dict, dict) else intent_dict.operation
+        if operation not in {"replace", "multi_replace"}:
+            return None
+
+        user_message = intent_dict.get("user_message", "") if isinstance(intent_dict, dict) else getattr(intent_dict, "user_message", "")
+        if not user_message:
+            return None
+
+        patterns = [
+            r'把[“"「](.+?)[”"」]改成[“"「](.+?)[”"」]',
+            r'把[“"「](.+?)[”"」]改为[“"「](.+?)[”"」]',
+            r'将[“"「](.+?)[”"」]改成[“"「](.+?)[”"」]',
+            r'将[“"「](.+?)[”"」]改为[“"「](.+?)[”"」]',
+        ]
+        old_text = None
+        new_text = None
+        for pattern in patterns:
+            match = re.search(pattern, user_message)
+            if match:
+                old_text = match.group(1).strip()
+                new_text = match.group(2).strip()
+                break
+
+        if not old_text or new_text is None:
+            return None
+
+        if old_text not in (block.content_md or "") and old_text not in (block.plain_text or ""):
+            return None
+
+        if old_text in (block.content_md or ""):
+            new_content_md = block.content_md.replace(old_text, new_text, 1)
+        else:
+            new_content_md = (block.content_md or "").replace(block.plain_text or "", (block.plain_text or "").replace(old_text, new_text, 1), 1)
+
+        if not new_content_md or new_content_md == block.content_md:
+            return None
+
+        return EditOperation(
+            op_type="replace",
+            target_block_id=str(block.block_id),
+            evidence=evidence,
+            new_content_md=new_content_md,
+            rationale="基于明确的替换指令执行规则化改写",
         )
     
     def _estimate_impact(self, operations) -> str:

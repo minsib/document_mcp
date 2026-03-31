@@ -4,17 +4,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from prometheus_client import make_asgi_app
 import uuid
-from typing import Optional
+from typing import Any, Dict, Optional
 import logging
 import json
 
 from app.config import get_settings
 from app.db.connection import get_db, engine
+from app.db.schema_sync import ensure_memory_schema
 from app.models.database import Base
 from app.auth.models import User as AuthUser, APIKey
 from app.models.schemas import (
     UploadDocumentResponse, ChatEditRequest, ChatEditResponse,
-    ConfirmRequest, ConfirmResponse
+    ConfirmRequest, ConfirmResponse, ChatSessionDetailResponse,
+    ChatMessageResponse, UserPreferenceResponse, UserPreferenceUpsertRequest,
+    UserMemoryItemResponse
 )
 from app.services.splitter import BlockSplitter
 from app.models import database as db_models
@@ -23,6 +26,13 @@ from app.auth.router import router as auth_router
 from app.monitoring.health import router as health_router
 from app.monitoring.middleware import MetricsMiddleware, LoggingMiddleware
 from app.monitoring.metrics import app_info
+from app.services.chat_sessions import (
+    append_chat_message,
+    ensure_chat_session,
+    normalize_session_id,
+)
+from app.services.memory import MemoryService
+from app.services.memory_scheduler import MemoryMaintenanceScheduler
 
 # 配置日志
 logging.basicConfig(
@@ -35,6 +45,7 @@ settings = get_settings()
 
 # 创建数据库表
 Base.metadata.create_all(bind=engine)
+ensure_memory_schema(engine)
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -73,6 +84,18 @@ app_info.info({
     'environment': settings.APP_ENV
 })
 
+memory_scheduler = MemoryMaintenanceScheduler()
+
+
+@app.on_event("startup")
+async def startup_memory_scheduler() -> None:
+    memory_scheduler.start()
+
+
+@app.on_event("shutdown")
+async def shutdown_memory_scheduler() -> None:
+    await memory_scheduler.stop()
+
 
 @app.get("/")
 async def root():
@@ -86,6 +109,82 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+def _get_owned_document_or_404(db: Session, doc_id: str, user_id: uuid.UUID) -> db_models.Document:
+    """Ensure the current user owns the target document."""
+    try:
+        doc_uuid = uuid.UUID(doc_id)
+    except ValueError as exc:
+        raise HTTPException(400, "无效的 doc_id") from exc
+
+    document = db.query(db_models.Document).filter(
+        db_models.Document.doc_id == doc_uuid,
+        db_models.Document.user_id == user_id,
+    ).first()
+    if not document:
+        raise HTTPException(404, "文档不存在或无权限访问")
+    return document
+
+
+def _session_status_from_response(status_value: str) -> str:
+    """Map API response statuses to persisted chat session statuses."""
+    return {
+        "applied": "completed",
+        "need_confirm": "awaiting_confirmation",
+        "need_disambiguation": "awaiting_disambiguation",
+        "need_clarification": "awaiting_clarification",
+        "cancelled": "cancelled",
+        "failed": "failed",
+    }.get(status_value, "active")
+
+
+def _persist_chat_turn(
+    db: Session,
+    *,
+    session_id: str,
+    user_content: str,
+    user_meta: Dict[str, Any],
+    assistant_content: str,
+    assistant_meta: Dict[str, Any],
+) -> tuple[db_models.ChatMessage, db_models.ChatMessage]:
+    """Persist a single user/assistant turn."""
+    user_message = append_chat_message(
+        db,
+        session_id=session_id,
+        role="user",
+        content=user_content,
+        meta=user_meta,
+    )
+    assistant_message = append_chat_message(
+        db,
+        session_id=session_id,
+        role="assistant",
+        content=assistant_content,
+        meta=assistant_meta,
+    )
+    return user_message, assistant_message
+
+
+def _ensure_session_or_409(
+    db: Session,
+    *,
+    session_id: str,
+    user_id: str,
+    doc_id: str,
+    status: str,
+) -> None:
+    """Create or update a chat session, surfacing ownership conflicts as HTTP errors."""
+    try:
+        ensure_chat_session(
+            db,
+            session_id=session_id,
+            user_id=user_id,
+            doc_id=doc_id,
+            status=status,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, "session_id 与当前用户或文档不匹配") from exc
 
 
 @app.post("/v1/docs/upload", response_model=UploadDocumentResponse)
@@ -234,18 +333,27 @@ async def export_document(
 @app.post("/v1/chat/edit", response_model=ChatEditResponse)
 async def chat_edit(
     request: ChatEditRequest,
+    current_user: AuthUser = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
     """对话式编辑"""
     from app.services.workflow import EditWorkflow
-    
-    # 模拟用户 ID（实际应该从认证中获取）
-    user_id = str(uuid.uuid4())
-    
-    # 创建或获取 session
-    session_id = request.session_id or str(uuid.uuid4())
-    
-    # 执行工作流
+
+    _get_owned_document_or_404(db, request.doc_id, current_user.user_id)
+    user_id = str(current_user.user_id)
+    session_id = normalize_session_id(
+        request.session_id,
+        user_id=user_id,
+        doc_id=request.doc_id,
+    )
+    _ensure_session_or_409(
+        db,
+        session_id=session_id,
+        user_id=user_id,
+        doc_id=request.doc_id,
+        status="active",
+    )
+
     workflow = EditWorkflow(db)
     result = workflow.execute(
         doc_id=request.doc_id,
@@ -254,13 +362,61 @@ async def chat_edit(
         user_message=request.message,
         user_selection=request.user_selection
     )
-    
+
+    _ensure_session_or_409(
+        db,
+        session_id=session_id,
+        user_id=user_id,
+        doc_id=request.doc_id,
+        status=_session_status_from_response(result.status),
+    )
+    user_turn, assistant_turn = _persist_chat_turn(
+        db,
+        session_id=session_id,
+        user_content=request.message,
+        user_meta={
+            "request_type": "edit",
+            "doc_id": request.doc_id,
+            "user_selection": request.user_selection,
+        },
+        assistant_content=result.message,
+        assistant_meta={
+            "request_type": "edit",
+            "doc_id": request.doc_id,
+            "status": result.status,
+            "operation_type": workflow.last_operation_type,
+            "confirm_token": result.confirm_token,
+            "preview_hash": result.preview_hash,
+            "new_rev_id": result.new_rev_id,
+            "clarification": result.clarification,
+            "preview": result.preview.model_dump() if result.preview else None,
+            "diff_summary": [item.model_dump() for item in result.diff_summary] if result.diff_summary else None,
+            "trace": workflow.last_trace,
+        },
+    )
+    db.flush()
+    try:
+        MemoryService(db).record_turn(
+            user_id=user_id,
+            doc_id=request.doc_id,
+            session_id=session_id,
+            user_content=request.message,
+            user_meta=user_turn.meta or {},
+            assistant_content=result.message,
+            assistant_meta=assistant_turn.meta or {},
+            source_message_ids=[str(user_turn.msg_id), str(assistant_turn.msg_id)],
+        )
+    except Exception:
+        logger.exception("Failed to record memory for chat_edit")
+    db.commit()
+
     return result
 
 
 @app.post("/v1/chat/confirm", response_model=ConfirmResponse)
 async def confirm_edit(
     request: ConfirmRequest,
+    current_user: AuthUser = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
     """确认编辑"""
@@ -270,18 +426,31 @@ async def confirm_edit(
     from app.services.cache import get_cache_manager
     from app.monitoring.metrics import edits_applied, edits_failed
     
-    # 模拟用户 ID
-    user_id = str(uuid.uuid4())
+    _get_owned_document_or_404(db, request.doc_id, current_user.user_id)
+    user_id = str(current_user.user_id)
+    session_id = normalize_session_id(
+        request.session_id,
+        user_id=user_id,
+        doc_id=request.doc_id,
+    )
+    _ensure_session_or_409(
+        db,
+        session_id=session_id,
+        user_id=user_id,
+        doc_id=request.doc_id,
+        status="active",
+    )
     
     # 获取 cache manager
     cache = get_cache_manager()
     
     # 1. 获取 token payload
-    payload = cache.get_confirm_token(request.session_id, request.confirm_token)
+    payload = cache.get_confirm_token(session_id, request.confirm_token)
     
     if not payload:
         return ConfirmResponse(
             status="failed",
+            session_id=session_id,
             message="Token 无效或已过期",
             error={"code": "invalid_token", "message": "Token 无效或已过期"}
         )
@@ -290,23 +459,35 @@ async def confirm_edit(
     if payload["doc_id"] != request.doc_id:
         return ConfirmResponse(
             status="failed",
+            session_id=session_id,
             message="Token doc_id 不匹配",
             error={"code": "token_mismatch", "message": "Token doc_id 不匹配"}
         )
     
-    if payload["session_id"] != request.session_id:
+    if payload["session_id"] != session_id:
         return ConfirmResponse(
             status="failed",
+            session_id=session_id,
             message="Token session_id 不匹配",
             error={"code": "token_mismatch", "message": "Token session_id 不匹配"}
+        )
+
+    if payload.get("user_id") != user_id:
+        cache.delete_confirm_token(session_id, request.confirm_token)
+        return ConfirmResponse(
+            status="failed",
+            session_id=session_id,
+            message="Token user_id 不匹配",
+            error={"code": "token_mismatch", "message": "Token user_id 不匹配"},
         )
     
     # 3. 过期校验
     import time
     if time.time() > payload["expires_at"]:
-        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        cache.delete_confirm_token(session_id, request.confirm_token)
         return ConfirmResponse(
             status="failed",
+            session_id=session_id,
             message="Token 已过期",
             error={"code": "token_expired", "message": "Token 已过期"}
         )
@@ -320,15 +501,17 @@ async def confirm_edit(
     if not active_rev:
         return ConfirmResponse(
             status="failed",
+            session_id=session_id,
             message="文档不存在",
             error={"code": "doc_not_found", "message": "文档不存在"}
         )
     
     # 5. 版本校验
     if payload["active_rev_id"] != str(active_rev.rev_id):
-        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        cache.delete_confirm_token(session_id, request.confirm_token)
         return ConfirmResponse(
             status="failed",
+            session_id=session_id,
             message="文档已被他人修改，预览已失效",
             error={
                 "code": "document_modified",
@@ -339,9 +522,10 @@ async def confirm_edit(
         )
     
     if payload["active_version"] != active_rev.version:
-        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        cache.delete_confirm_token(session_id, request.confirm_token)
         return ConfirmResponse(
             status="failed",
+            session_id=session_id,
             message="文档版本已变更，预览已失效",
             error={
                 "code": "version_mismatch",
@@ -353,25 +537,70 @@ async def confirm_edit(
     
     # 6. 取消操作
     if request.action == "cancel":
-        cache.delete_confirm_token(request.session_id, request.confirm_token)
-        return ConfirmResponse(
+        cache.delete_confirm_token(session_id, request.confirm_token)
+        response = ConfirmResponse(
             status="cancelled",
+            session_id=session_id,
             message="已取消修改"
         )
+        _ensure_session_or_409(
+            db,
+            session_id=session_id,
+            user_id=user_id,
+            doc_id=request.doc_id,
+            status=_session_status_from_response(response.status),
+        )
+        user_turn, assistant_turn = _persist_chat_turn(
+            db,
+            session_id=session_id,
+            user_content="取消本次修改",
+            user_meta={
+                "request_type": "confirm",
+                "action": request.action,
+                "doc_id": request.doc_id,
+                "confirm_token": request.confirm_token,
+                "preview_hash": request.preview_hash,
+            },
+            assistant_content=response.message,
+            assistant_meta={
+                "request_type": "confirm",
+                "status": response.status,
+                "doc_id": request.doc_id,
+                "confirm_token": request.confirm_token,
+            },
+        )
+        db.flush()
+        try:
+            MemoryService(db).record_turn(
+                user_id=user_id,
+                doc_id=request.doc_id,
+                session_id=session_id,
+                user_content="取消本次修改",
+                user_meta=user_turn.meta or {},
+                assistant_content=response.message,
+                assistant_meta=assistant_turn.meta or {},
+                source_message_ids=[str(user_turn.msg_id), str(assistant_turn.msg_id)],
+            )
+        except Exception:
+            logger.exception("Failed to record memory for confirm cancel")
+        db.commit()
+        return response
     
     # 7. preview_hash 校验
     if not request.preview_hash:
-        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        cache.delete_confirm_token(session_id, request.confirm_token)
         return ConfirmResponse(
             status="failed",
+            session_id=session_id,
             message="缺少 preview_hash",
             error={"code": "missing_preview_hash", "message": "缺少 preview_hash"}
         )
     
     if request.preview_hash != payload.get("preview_hash"):
-        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        cache.delete_confirm_token(session_id, request.confirm_token)
         return ConfirmResponse(
             status="failed",
+            session_id=session_id,
             message="预览内容已变更，请重新确认",
             error={"code": "preview_hash_mismatch", "message": "预览内容已变更"}
         )
@@ -383,9 +612,10 @@ async def confirm_edit(
     plan_hash = hashlib.sha256(plan_json.encode()).hexdigest()
     
     if plan_hash != payload.get("plan_hash"):
-        cache.delete_confirm_token(request.session_id, request.confirm_token)
+        cache.delete_confirm_token(session_id, request.confirm_token)
         return ConfirmResponse(
             status="failed",
+            session_id=session_id,
             message="编辑计划已被篡改",
             error={"code": "plan_hash_mismatch", "message": "编辑计划已被篡改"}
         )
@@ -393,20 +623,21 @@ async def confirm_edit(
     # 9. 执行修改
     state = {
         "doc_id": request.doc_id,
-        "session_id": request.session_id,
+        "session_id": session_id,
         "user_id": user_id,
         "active_rev_id": str(active_rev.rev_id),
         "active_version": active_rev.version,
         "edit_plan": edit_plan,
         "retry_count": 0,
-        "max_retries": 2
+        "max_retries": 2,
+        "_workflow_trace": payload.get("workflow_trace", {}),
     }
     
     apply_node = ApplyEditsNode(db)
     result = apply_node(state)
     
     # 10. 删除 token（一次性使用）
-    cache.delete_confirm_token(request.session_id, request.confirm_token)
+    cache.delete_confirm_token(session_id, request.confirm_token)
     
     if result.get("apply_result"):
         edits_applied.labels(operation_type=operation_type).inc()
@@ -414,13 +645,58 @@ async def confirm_edit(
         from app.services.workflow import EditWorkflow
         workflow = EditWorkflow(db, cache)
         export_md = workflow._export_document(result["apply_result"].new_rev_id)
-        
-        return ConfirmResponse(
+        response = ConfirmResponse(
             status="applied",
+            session_id=session_id,
             new_rev_id=result["apply_result"].new_rev_id,
             export_md=export_md,
             message="修改已应用"
         )
+        _ensure_session_or_409(
+            db,
+            session_id=session_id,
+            user_id=user_id,
+            doc_id=request.doc_id,
+            status=_session_status_from_response(response.status),
+        )
+        user_turn, assistant_turn = _persist_chat_turn(
+            db,
+            session_id=session_id,
+            user_content="确认应用修改",
+            user_meta={
+                "request_type": "confirm",
+                "action": request.action,
+                "doc_id": request.doc_id,
+                "confirm_token": request.confirm_token,
+                "preview_hash": request.preview_hash,
+            },
+            assistant_content=response.message,
+            assistant_meta={
+                "request_type": "confirm",
+                "status": response.status,
+                "doc_id": request.doc_id,
+                "operation_type": operation_type,
+                "confirm_token": request.confirm_token,
+                "new_rev_id": response.new_rev_id,
+                "trace": payload.get("workflow_trace", {}),
+            },
+        )
+        db.flush()
+        try:
+            MemoryService(db).record_turn(
+                user_id=user_id,
+                doc_id=request.doc_id,
+                session_id=session_id,
+                user_content="确认应用修改",
+                user_meta=user_turn.meta or {},
+                assistant_content=response.message,
+                assistant_meta=assistant_turn.meta or {},
+                source_message_ids=[str(user_turn.msg_id), str(assistant_turn.msg_id)],
+            )
+        except Exception:
+            logger.exception("Failed to record memory for confirm apply")
+        db.commit()
+        return response
     else:
         error = result.get("error", {})
         if hasattr(error, 'model_dump'):
@@ -429,12 +705,58 @@ async def confirm_edit(
             operation_type=operation_type,
             error_type=error.get("code", "apply_failed")
         ).inc()
-        
-        return ConfirmResponse(
+
+        response = ConfirmResponse(
             status="failed",
+            session_id=session_id,
             message=error.get("message", "应用修改失败"),
             error=error
         )
+        _ensure_session_or_409(
+            db,
+            session_id=session_id,
+            user_id=user_id,
+            doc_id=request.doc_id,
+            status=_session_status_from_response(response.status),
+        )
+        user_turn, assistant_turn = _persist_chat_turn(
+            db,
+            session_id=session_id,
+            user_content="确认应用修改",
+            user_meta={
+                "request_type": "confirm",
+                "action": request.action,
+                "doc_id": request.doc_id,
+                "confirm_token": request.confirm_token,
+                "preview_hash": request.preview_hash,
+            },
+            assistant_content=response.message,
+            assistant_meta={
+                "request_type": "confirm",
+                "status": response.status,
+                "doc_id": request.doc_id,
+                "operation_type": operation_type,
+                "confirm_token": request.confirm_token,
+                "error": error,
+                "trace": payload.get("workflow_trace", {}),
+            },
+        )
+        db.flush()
+        try:
+            MemoryService(db).record_turn(
+                user_id=user_id,
+                doc_id=request.doc_id,
+                session_id=session_id,
+                user_content="确认应用修改",
+                user_meta=user_turn.meta or {},
+                assistant_content=response.message,
+                assistant_meta=assistant_turn.meta or {},
+                source_message_ids=[str(user_turn.msg_id), str(assistant_turn.msg_id)],
+            )
+        except Exception:
+            logger.exception("Failed to record memory for confirm failure")
+        db.commit()
+        return response
 
 
 if __name__ == "__main__":
@@ -566,6 +888,7 @@ async def rollback_revision(
 @app.post("/v1/chat/bulk-edit")
 async def bulk_edit(
     request: dict,
+    current_user: AuthUser = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -595,8 +918,15 @@ async def bulk_edit(
     match_type = request.get("match_type", "exact_term")
     scope_filter = request.get("scope_filter", {})
     
-    if not all([session_id, doc_id, message]):
+    if not all([doc_id, message]):
         raise HTTPException(400, "缺少必需参数")
+
+    _get_owned_document_or_404(db, doc_id, current_user.user_id)
+    session_id = normalize_session_id(
+        session_id,
+        user_id=str(current_user.user_id),
+        doc_id=doc_id,
+    )
     
     # 获取当前活跃版本
     doc_uuid = uuid.UUID(doc_id)
@@ -670,6 +1000,7 @@ async def bulk_edit(
         payload = {
             "token_id": token_id,
             "session_id": session_id,
+            "user_id": str(current_user.user_id),
             "doc_id": doc_id,
             "active_rev_id": str(active_rev.rev_id),
             "active_version": active_rev.version,
@@ -685,6 +1016,7 @@ async def bulk_edit(
         return {
             "status": "need_confirm",
             "message": f"将修改 {preview.total_changes} 处内容，请确认",
+            "session_id": session_id,
             "preview": preview.model_dump(),
             "confirm_token": token_id,
             "preview_hash": preview_hash,
@@ -700,6 +1032,7 @@ async def bulk_edit(
 @app.post("/v1/chat/bulk-confirm")
 async def bulk_confirm(
     request: dict,
+    current_user: AuthUser = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -728,6 +1061,13 @@ async def bulk_confirm(
     
     if not all([session_id, doc_id, confirm_token, preview_hash]):
         raise HTTPException(400, "缺少必需参数")
+
+    _get_owned_document_or_404(db, doc_id, current_user.user_id)
+    session_id = normalize_session_id(
+        session_id,
+        user_id=str(current_user.user_id),
+        doc_id=doc_id,
+    )
     
     # 获取 token payload
     cache = get_cache_manager()
@@ -735,6 +1075,10 @@ async def bulk_confirm(
     
     if not payload:
         raise HTTPException(400, "确认令牌无效或已过期")
+
+    if payload.get("user_id") != str(current_user.user_id):
+        cache.delete_confirm_token(session_id, confirm_token)
+        raise HTTPException(403, "确认令牌不属于当前用户")
     
     # 验证 preview_hash
     if preview_hash != payload.get("preview_hash"):
@@ -773,7 +1117,7 @@ async def bulk_confirm(
             doc_id,
             str(active_rev.rev_id),
             active_rev.version,
-            user_id=str(uuid.uuid4()),  # 实际应该从认证中获取
+            user_id=str(current_user.user_id),
             trace_id=None
         )
         
@@ -800,3 +1144,232 @@ async def bulk_confirm(
     except Exception as e:
         db.rollback()
         raise HTTPException(500, f"应用批量修改失败: {str(e)}")
+
+
+@app.get("/v1/chat/sessions/{session_id}", response_model=ChatSessionDetailResponse)
+async def get_chat_session(
+    session_id: str,
+    current_user: AuthUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """查看当前用户的会话历史"""
+    try:
+        session, messages = MemoryService(db).get_session_history(
+            user_id=str(current_user.user_id),
+            session_id=session_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, "会话不存在") from exc
+
+    return ChatSessionDetailResponse(
+        session_id=str(session.session_id),
+        doc_id=str(session.doc_id),
+        status=session.status,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        messages=[
+            ChatMessageResponse(
+                msg_id=str(message.msg_id),
+                role=message.role,
+                content=message.content,
+                meta=message.meta,
+                created_at=message.created_at,
+            )
+            for message in messages
+        ],
+    )
+
+
+@app.get("/v1/users/me/preferences", response_model=list[UserPreferenceResponse])
+async def list_my_preferences(
+    current_user: AuthUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """查看当前用户的长期偏好"""
+    items = MemoryService(db).list_user_preferences(str(current_user.user_id))
+    return [
+        UserPreferenceResponse(
+            preference_key=item.preference_key,
+            preference_value=item.preference_value,
+            source_type=item.source_type,
+            source=item.source,
+            confidence=item.confidence,
+            updated_at=item.updated_at,
+        )
+        for item in items
+    ]
+
+
+@app.put("/v1/users/me/preferences/{preference_key}", response_model=UserPreferenceResponse)
+async def upsert_my_preference(
+    preference_key: str,
+    request: UserPreferenceUpsertRequest,
+    current_user: AuthUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """显式更新当前用户偏好"""
+    item = MemoryService(db).upsert_user_preference(
+        user_id=str(current_user.user_id),
+        preference_key=preference_key,
+        preference_value=request.preference_value,
+        source=request.source,
+        source_type="explicit" if request.source == "user_explicit" else "inferred",
+        confidence=1.0 if request.source == "user_explicit" else 0.9,
+        details={"updated_via": "api"},
+    )
+    db.commit()
+    db.refresh(item)
+    return UserPreferenceResponse(
+        preference_key=item.preference_key,
+        preference_value=item.preference_value,
+        source_type=item.source_type,
+        source=item.source,
+        confidence=item.confidence,
+        updated_at=item.updated_at,
+    )
+
+
+@app.delete("/v1/users/me/preferences/{preference_key}")
+async def delete_my_preference(
+    preference_key: str,
+    current_user: AuthUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """删除当前用户偏好"""
+    deleted = MemoryService(db).delete_user_preference(
+        user_id=str(current_user.user_id),
+        preference_key=preference_key,
+    )
+    if not deleted:
+        raise HTTPException(404, "偏好不存在")
+    db.commit()
+    return {"status": "deleted", "preference_key": preference_key}
+
+
+@app.get("/v1/users/me/memory", response_model=list[UserMemoryItemResponse])
+async def list_my_memory(
+    memory_type: Optional[str] = None,
+    scope: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    active_only: bool = True,
+    limit: int = 50,
+    current_user: AuthUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """查看当前用户的情景记忆"""
+    items = MemoryService(db).list_memory_items(
+        user_id=str(current_user.user_id),
+        memory_type=memory_type,
+        scope=scope,
+        doc_id=doc_id,
+        active_only=active_only,
+        limit=min(limit, 100),
+    )
+    return [
+        UserMemoryItemResponse(
+            memory_id=str(item.memory_id),
+            memory_layer=item.memory_layer,
+            memory_type=item.memory_type,
+            memory_subtype=item.memory_subtype,
+            scope=item.scope,
+            title=item.title,
+            content=item.content,
+            summary=item.summary,
+            confidence=item.confidence,
+            importance=item.importance,
+            memory_strength=item.memory_strength,
+            stability=item.stability,
+            retention_score=item.retention_score,
+            review_count=item.review_count,
+            recall_count=item.recall_count,
+            doc_id=str(item.doc_id) if item.doc_id else None,
+            session_id=str(item.session_id) if item.session_id else None,
+            created_at=item.created_at,
+            last_recalled_at=item.last_recalled_at,
+            archived_at=item.archived_at,
+        )
+        for item in items
+    ]
+
+
+@app.get("/v1/docs/{doc_id}/preferences", response_model=list[UserPreferenceResponse])
+async def list_document_preferences(
+    doc_id: str,
+    current_user: AuthUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """查看某篇文档的结构化偏好"""
+    _get_owned_document_or_404(db, doc_id, current_user.user_id)
+    items = MemoryService(db).list_document_preferences(str(current_user.user_id), doc_id)
+    return [
+        UserPreferenceResponse(
+            preference_key=item.preference_key,
+            preference_value=item.preference_value,
+            source_type=item.source_type,
+            source=item.source,
+            confidence=item.confidence,
+            updated_at=item.updated_at,
+        )
+        for item in items
+    ]
+
+
+@app.put("/v1/docs/{doc_id}/preferences/{preference_key}", response_model=UserPreferenceResponse)
+async def upsert_document_preference(
+    doc_id: str,
+    preference_key: str,
+    request: UserPreferenceUpsertRequest,
+    current_user: AuthUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """显式更新某篇文档的结构化偏好"""
+    _get_owned_document_or_404(db, doc_id, current_user.user_id)
+    item = MemoryService(db).upsert_document_preference(
+        user_id=str(current_user.user_id),
+        doc_id=doc_id,
+        preference_key=preference_key,
+        preference_value=request.preference_value,
+        scope_type="document",
+        scope_key=doc_id,
+        source=request.source,
+        source_type="explicit" if request.source == "user_explicit" else "inferred",
+        confidence=1.0 if request.source == "user_explicit" else 0.9,
+    )
+    db.commit()
+    db.refresh(item)
+    return UserPreferenceResponse(
+        preference_key=item.preference_key,
+        preference_value=item.preference_value,
+        source_type=item.source_type,
+        source=item.source,
+        confidence=item.confidence,
+        updated_at=item.updated_at,
+    )
+
+
+@app.delete("/v1/users/me/memory/{memory_id}")
+async def delete_my_memory(
+    memory_id: str,
+    current_user: AuthUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """删除当前用户的某条情景记忆"""
+    deleted = MemoryService(db).delete_memory_item(
+        user_id=str(current_user.user_id),
+        memory_id=memory_id,
+    )
+    if not deleted:
+        raise HTTPException(404, "记忆不存在")
+    db.commit()
+    return {"status": "deleted", "memory_id": memory_id}
+
+
+@app.post("/v1/users/me/memory/maintenance")
+async def run_my_memory_maintenance(
+    current_user: AuthUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """手动执行一次当前用户记忆热度衰减和归档"""
+    result = MemoryService(db).run_maintenance(user_id=str(current_user.user_id))
+    db.commit()
+    return {"status": "ok", **result}

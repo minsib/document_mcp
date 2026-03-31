@@ -219,6 +219,58 @@ class CacheManager:
                 self.redis_client.delete(cache_key)
             except Exception as e:
                 print(f"Redis 删除失败: {e}")
+
+    def get_working_memory(self, session_id: str) -> Optional[dict]:
+        """获取会话工作记忆"""
+        cache_key = f"working_memory:{session_id}"
+
+        if cache_key in self._local_cache:
+            return self._local_cache[cache_key]
+
+        if self.redis_available:
+            try:
+                cached = self.redis_client.get(cache_key)
+                if cached:
+                    data = json.loads(cached)
+                    self._local_cache[cache_key] = data
+                    self._trim_local_cache()
+                    return data
+            except Exception as e:
+                print(f"Redis 读取失败: {e}")
+
+        return None
+
+    def set_working_memory(self, session_id: str, payload: dict, ttl: int = 86400) -> bool:
+        """设置会话工作记忆"""
+        cache_key = f"working_memory:{session_id}"
+
+        self._local_cache[cache_key] = payload
+        self._trim_local_cache()
+
+        if self.redis_available:
+            try:
+                self.redis_client.setex(
+                    cache_key,
+                    ttl,
+                    json.dumps(payload)
+                )
+                return True
+            except Exception as e:
+                print(f"Redis 写入失败: {e}")
+                return False
+
+        return True
+
+    def delete_working_memory(self, session_id: str):
+        """删除会话工作记忆"""
+        cache_key = f"working_memory:{session_id}"
+        self._local_cache.pop(cache_key, None)
+
+        if self.redis_available:
+            try:
+                self.redis_client.delete(cache_key)
+            except Exception as e:
+                print(f"Redis 删除失败: {e}")
     
     def _trim_local_cache(self):
         """修剪本地缓存"""

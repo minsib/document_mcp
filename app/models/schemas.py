@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Dict
+from typing import Any, List, Optional, Literal, Dict
 from uuid import UUID
 from datetime import datetime
 
@@ -124,6 +124,7 @@ class CandidateResponse(BaseModel):
 
 class ChatEditResponse(BaseModel):
     status: Literal["need_disambiguation", "need_confirm", "need_clarification", "applied", "failed"]
+    session_id: Optional[str] = None
     candidates: Optional[List[CandidateResponse]] = None
     preview: Optional[PreviewDiff] = None
     confirm_token: Optional[str] = None
@@ -146,6 +147,7 @@ class ConfirmRequest(BaseModel):
 
 class ConfirmResponse(BaseModel):
     status: Literal["applied", "cancelled", "failed"]
+    session_id: Optional[str] = None
     new_rev_id: Optional[str] = None
     export_md: Optional[str] = None
     error: Optional[dict] = None
@@ -175,6 +177,60 @@ class RollbackResponse(BaseModel):
     new_rev_id: str
     new_rev_no: int
     message: str
+
+
+class UserPreferenceResponse(BaseModel):
+    preference_key: str
+    preference_value: Any
+    source_type: str
+    source: str
+    confidence: float
+    updated_at: datetime
+
+
+class UserPreferenceUpsertRequest(BaseModel):
+    preference_value: Any
+    source: str = "user_explicit"
+
+
+class UserMemoryItemResponse(BaseModel):
+    memory_id: str
+    memory_layer: str
+    memory_type: str
+    memory_subtype: Optional[str]
+    scope: str
+    title: str
+    content: str
+    summary: Optional[str]
+    confidence: float
+    importance: float
+    memory_strength: float
+    stability: float
+    retention_score: float
+    review_count: int
+    recall_count: int
+    doc_id: Optional[str]
+    session_id: Optional[str]
+    created_at: datetime
+    last_recalled_at: Optional[datetime]
+    archived_at: Optional[datetime]
+
+
+class ChatMessageResponse(BaseModel):
+    msg_id: str
+    role: str
+    content: str
+    meta: Optional[dict]
+    created_at: datetime
+
+
+class ChatSessionDetailResponse(BaseModel):
+    session_id: str
+    doc_id: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    messages: List[ChatMessageResponse]
 
 
 # ============ 内部状态 ============

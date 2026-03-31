@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     # 功能开关
     ENABLE_VECTOR_SEARCH: bool = False
     ENABLE_METRICS: bool = True
+    ENABLE_MEMORY_MAINTENANCE_SCHEDULER: bool = True
+    MEMORY_MAINTENANCE_INTERVAL_MINUTES: int = 60
     
     # 安全配置
     SECRET_KEY: str = "change-this-in-production"

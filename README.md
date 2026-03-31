@@ -16,8 +16,10 @@
 - 🔄 **批量修改**：支持全文统一替换和批量编辑
 - 🔒 **并发安全**：乐观锁机制，防止并发冲突
 - 🔐 **用户认证**：JWT Token + API Key 双重认证
+- 🗂️ **会话落库**：每轮 user/assistant 对话按 `session_id` 落库，支持回放与审计
+- 🧠 **多层记忆体**：工作记忆 + 情景记忆 + 长期结构化偏好，支持个性化编辑
 - 📊 **完整审计**：所有操作可追溯，支持审计查询
-- 📈 **监控告警**：健康检查 + Prometheus 指标
+- 📈 **监控告警**：健康检查 + Prometheus + Grafana 看板
 - ⚡ **智能降级**：多级降级策略确保系统稳定性
 - 👥 **协同编辑**：基于 Redis + WebSocket 的实时多人协作
 
@@ -30,7 +32,7 @@
 - **搜索引擎**：Meilisearch
 - **缓存**：Redis
 - **LLM**：Qwen3-235B (通过 API)
-- **工作流**：LangChain + LangGraph
+- **工作流**：LangGraph + agent/skill 风格编排
 - **可观测性**：Langfuse
 - **监控**：Prometheus + Grafana
 
@@ -45,17 +47,19 @@
 ┌─────────────────────────────────────┐
 │  API Server (FastAPI)               │
 │  ├─ LangGraph 工作流引擎            │
-│  ├─ 意图解析 (Qwen3-235B)          │
+│  ├─ Agent + Skill 编排层           │
+│  ├─ 意图解析 / 编辑规划 (Qwen)      │
 │  ├─ 混合检索 (BM25 + Vector)       │
+│  ├─ 多层记忆服务                    │
 │  └─ 编辑执行引擎                    │
 └──────┬──────────────────────────────┘
        │
-       ├──────────────┬──────────────┬──────────────┐
-       ↓              ↓              ↓              ↓
-┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
-│ Postgres │   │  Redis   │   │Meilisearch│   │Qwen3 API │
-│ +pgvector│   │ (Cache)  │   │  (BM25)   │   │ (235B)   │
-└──────────┘   └──────────┘   └──────────┘   └──────────┘
+       ├──────────────┬──────────────┬──────────────┬──────────────┐
+       ↓              ↓              ↓              ↓              ↓
+┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│ Postgres │   │  Redis   │   │Meilisearch│   │Qwen API  │   │Prom/Graf.│
+│ +pgvector│   │ (工作记忆)│   │  (BM25)   │   │ LLM/Emb. │   │ 监控看板 │
+└──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘
 ```
 
 ## 快速开始
@@ -136,6 +140,10 @@ LANGFUSE_HOST=https://cloud.langfuse.com
 # 应用配置
 APP_ENV=development
 LOG_LEVEL=INFO
+
+# 记忆维护任务
+ENABLE_MEMORY_MAINTENANCE_SCHEDULER=true
+MEMORY_MAINTENANCE_INTERVAL_MINUTES=60
 ```
 
 5. **初始化数据库**
@@ -147,12 +155,15 @@ createdb document_edit
 # 安装 pgvector 扩展
 psql document_edit -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
-# 运行迁移
-alembic upgrade head
-
 # 创建管理员用户
 python3 scripts/create_admin_user.py
 ```
+
+说明：
+
+- 当前仓库的主启动路径会在应用启动时自动执行 `Base.metadata.create_all(...)`
+- 记忆体相关新增字段会在启动时通过 `schema_sync` 自动补齐
+- 如果你使用已有 PostgreSQL 数据卷，首次启动 API 时会自动补齐 AdaMem 风格的记忆字段
 
 6. **启动服务**
 
@@ -171,6 +182,28 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 
 - API 文档：http://localhost:8001/docs
 - 健康检查：http://localhost:8001/health
+- Prometheus：http://localhost:9090
+- Grafana：http://localhost:3000
+
+### Docker Compose 启动（推荐）
+
+项目已经包含 Prometheus、Grafana、Alertmanager 的基础编排：
+
+```bash
+docker compose up -d
+```
+
+启动后默认访问地址：
+
+- API 文档：http://localhost:8001/docs
+- Metrics：http://localhost:8001/metrics
+- Prometheus：http://localhost:9090
+- Grafana：http://localhost:3000
+
+Grafana 默认账号密码：
+
+- 用户名：`admin`
+- 密码：`admin`
 
 ## 使用示例
 
@@ -180,7 +213,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 
 ```bash
 # 注册用户
-curl -X POST "http://localhost:8000/v1/auth/register" \
+curl -X POST "http://localhost:8001/v1/auth/register" \
   -H "Content-Type: application/json" \
   -d '{
     "username": "testuser",
@@ -189,7 +222,7 @@ curl -X POST "http://localhost:8000/v1/auth/register" \
   }'
 
 # 登录获取 Token
-curl -X POST "http://localhost:8000/v1/auth/login" \
+curl -X POST "http://localhost:8001/v1/auth/login" \
   -H "Content-Type: application/json" \
   -d '{
     "username": "testuser",
@@ -204,7 +237,7 @@ curl -X POST "http://localhost:8000/v1/auth/login" \
 ### 1. 上传文档
 
 ```bash
-curl -X POST "http://localhost:8000/v1/docs/upload" \
+curl -X POST "http://localhost:8001/v1/docs/upload" \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -F "file=@document.md" \
   -F "title=项目需求文档"
@@ -222,8 +255,11 @@ curl -X POST "http://localhost:8000/v1/docs/upload" \
 
 ### 2. 对话式编辑
 
+`/v1/chat/edit` 和 `/v1/chat/confirm` 现在都要求真实认证用户。  
+会话会按 `session_id` 持久化到数据库，同一篇文档可以持续复用同一个会话。
+
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/edit" \
+curl -X POST "http://localhost:8001/v1/chat/edit" \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -237,6 +273,7 @@ curl -X POST "http://localhost:8000/v1/chat/edit" \
 ```json
 {
   "status": "need_confirm",
+  "session_id": "c7d8b0f4-7d2e-45a5-9b28-59d5d8f2a999",
   "preview": {
     "diffs": [
       {
@@ -260,11 +297,11 @@ curl -X POST "http://localhost:8000/v1/chat/edit" \
 ### 3. 确认修改
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/confirm" \
+curl -X POST "http://localhost:8001/v1/chat/confirm" \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "session_id": "session_123",
+    "session_id": "c7d8b0f4-7d2e-45a5-9b28-59d5d8f2a999",
     "doc_id": "550e8400-e29b-41d4-a716-446655440000",
     "confirm_token": "token_abc123",
     "preview_hash": "hash_xyz789",
@@ -276,23 +313,78 @@ curl -X POST "http://localhost:8000/v1/chat/confirm" \
 ```json
 {
   "status": "applied",
+  "session_id": "c7d8b0f4-7d2e-45a5-9b28-59d5d8f2a999",
   "new_rev_id": "770e8400-e29b-41d4-a716-446655440002",
   "message": "已成功修改 1 处内容"
 }
 ```
 
-### 4. 导出文档
+### 4. 查看会话历史
 
 ```bash
-curl -X GET "http://localhost:8000/v1/docs/550e8400-e29b-41d4-a716-446655440000/export?format=md" \
+curl -X GET "http://localhost:8001/v1/chat/sessions/c7d8b0f4-7d2e-45a5-9b28-59d5d8f2a999" \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+该接口会返回：
+
+- session 基本信息
+- 每一轮 user/assistant 消息
+- 每条消息的结构化 `meta`
+
+### 5. 查看和维护用户记忆
+
+#### 查看长期偏好
+
+```bash
+curl -X GET "http://localhost:8001/v1/users/me/preferences" \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+#### 显式更新长期偏好
+
+```bash
+curl -X PUT "http://localhost:8001/v1/users/me/preferences/response_style" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "preference_value": "concise",
+    "source": "user_explicit"
+  }'
+```
+
+#### 查看情景记忆
+
+```bash
+curl -X GET "http://localhost:8001/v1/users/me/memory" \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+#### 手动执行一次记忆遗忘曲线维护
+
+```bash
+curl -X POST "http://localhost:8001/v1/users/me/memory/maintenance" \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+说明：
+
+- 系统启动后会自动运行遗忘曲线维护定时任务
+- 默认每 `60` 分钟执行一次
+- 可通过 `ENABLE_MEMORY_MAINTENANCE_SCHEDULER` 和 `MEMORY_MAINTENANCE_INTERVAL_MINUTES` 调整
+
+### 6. 导出文档
+
+```bash
+curl -X GET "http://localhost:8001/v1/docs/550e8400-e29b-41d4-a716-446655440000/export?format=md" \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -o output.md
 ```
 
-### 5. 版本回滚
+### 7. 版本回滚
 
 ```bash
-curl -X POST "http://localhost:8000/v1/docs/550e8400-e29b-41d4-a716-446655440000/rollback" \
+curl -X POST "http://localhost:8001/v1/docs/550e8400-e29b-41d4-a716-446655440000/rollback" \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -301,7 +393,7 @@ curl -X POST "http://localhost:8000/v1/docs/550e8400-e29b-41d4-a716-446655440000
   }'
 ```
 
-### 6. 协同编辑（WebSocket）
+### 8. 协同编辑（WebSocket）
 
 系统支持基于 Redis + WebSocket 的实时多人协同编辑：
 
@@ -427,6 +519,35 @@ RRF(d) = Σ 1 / (k + rank(d))
 - 支持任意版本回滚
 - 审计日志记录所有操作
 
+### 5. 多层记忆体
+
+当前版本已实现一套接近 AdaMem 思路的多层记忆体 V1：
+
+- **工作记忆**：保存在 `Redis / 本地缓存`
+  - 当前会话目标
+  - 当前待确认 diff
+  - 当前澄清状态
+  - 当前最近一次执行结果
+- **情景记忆**：保存在 PostgreSQL `user_memory_items`
+  - 历史编辑请求摘要
+  - 成功/失败的编辑片段
+  - 某文档近期编辑上下文
+  - 字段更接近 AdaMem 的 episodic memory：`memory_layer / memory_subtype / memory_strength / stability / retention_score`
+  - 使用遗忘曲线式 `retention_score` 做衰减与归档
+- **长期结构化记忆**：保存在 PostgreSQL
+  - `user_preferences`
+  - `document_preferences`
+  - `editing_rules`
+  - `memory_audit_log`
+
+使用方式：
+
+- 工作流开始前加载长期偏好、文档偏好、编辑规则、相关情景记忆
+- `intent_parser` 和 `planner` 会消费 `memory_context`
+- 每轮对话落库后自动执行规则型记忆提取
+- 结构化记忆按 `persona / relation` 分层存储
+- 情景记忆维护 `memory_strength / stability / review_count / recall_count / retention_score`
+
 ## 项目结构
 
 ```
@@ -443,16 +564,22 @@ document_mcp/
 │   ├── services/               # 业务逻辑层
 │   │   ├── splitter.py         # 文档智能分块
 │   │   ├── retriever.py        # 混合检索（BM25 + 向量 + RRF）
+│   │   ├── memory.py           # 多层记忆体服务
 │   │   ├── langgraph_workflow.py  # LangGraph 工作流引擎 ✅
+│   │   ├── workflow.py         # 当前主编辑工作流
 │   │   ├── collaboration.py    # 协同编辑管理器 ✅
 │   │   ├── cache.py            # 多级缓存管理
 │   │   └── search_indexer.py   # Meilisearch 索引
 │   ├── agents/                 # 智能体层 ✅
+│   │   ├── runtime.py          # agent/skill 运行时抽象
+│   │   ├── edit_workflow_agents.py  # 编辑工作流 agent 装配
 │   │   ├── intent_agent.py     # 意图理解智能体
 │   │   ├── router_agent.py     # 路由决策智能体
 │   │   ├── clarify_agent.py    # 澄清确认智能体
 │   │   ├── retrieval_agent.py  # 检索定位智能体
 │   │   └── edit_agent.py       # 编辑执行智能体
+│   ├── skills/                 # 复用型 skill 层
+│   │   └── document_edit.py    # 文档编辑 skill bundle
 │   ├── tools/                  # 工具层 ✅
 │   │   ├── db_tools.py         # 数据库操作工具
 │   │   ├── search_tools.py     # 检索工具
@@ -461,8 +588,8 @@ document_mcp/
 │   ├── nodes/                  # 工作流节点（批量编辑等）
 │   ├── monitoring/             # 监控模块（Prometheus）
 │   └── utils/                  # 工具函数
-├── alembic/                    # 数据库迁移
-│   └── versions/               # 迁移脚本
+├── alembic/                    # 迁移脚本目录（当前未作为主启动依赖）
+│   └── versions/               # 历史迁移脚本
 ├── scripts/                    # 运维脚本
 │   ├── test_monitoring.py      # 监控测试脚本
 │   └── generate_monitoring_traffic.sh  # 流量生成
@@ -508,15 +635,15 @@ ruff check app/
 ### 数据库迁移
 
 ```bash
-# 创建新迁移
-alembic revision --autogenerate -m "描述"
-
-# 应用迁移
-alembic upgrade head
-
-# 回滚迁移
-alembic downgrade -1
+# 当前推荐方式：由应用启动时自动建表/补字段
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 ```
+
+说明：
+
+- `Base.metadata.create_all(...)` 负责新表创建
+- `app/db/schema_sync.py` 负责给已有库补齐记忆体相关字段和索引
+- 如果后续要引入正式迁移链路，建议先补全 Alembic 环境再恢复 `upgrade head`
 
 ## 部署
 
@@ -576,34 +703,53 @@ gunicorn app.main:app \
 
 ```bash
 # 健康检查
-curl http://localhost:8000/health/
+curl http://localhost:8001/health
 
 # Prometheus 指标
-curl http://localhost:8000/metrics
+curl http://localhost:8001/metrics
 
 # Kubernetes liveness probe
-curl http://localhost:8000/health/liveness
+curl http://localhost:8001/health/liveness
 
 # Kubernetes readiness probe
-curl http://localhost:8000/health/readiness
+curl http://localhost:8001/health/readiness
 ```
 
 
 ## 监控与告警
 
-系统提供完整的 Prometheus 指标收集：
+系统当前已接入完整的 Prometheus + Grafana 观测链路，覆盖以下面板：
 
-- **业务指标**：文档上传、编辑操作、批量修改、检索、认证
-- **性能指标**：请求延迟、LLM 调用、数据库、缓存、搜索
-- **系统指标**：应用信息、活跃用户、文档统计
-- **错误指标**：错误总数和分类
+- **编辑链路**
+  - 编辑请求数量
+  - 编辑成功率
+  - 编辑延迟
+- **LLM 调用**
+  - token usage
+  - LLM latency
+  - LLM error rate
+- **RAG 系统**
+  - retrieval latency
+  - retrieval empty rate
+- **Agent Workflow**
+  - workflow duration
+  - workflow error rate
 
-配置 Grafana 仪表盘查看：
-- 编辑请求成功率
-- 定位准确率
-- API 延迟分布（P50/P95/P99）
-- 数据库查询性能
-- LLM 调用统计和成本
+查看方式：
+
+- Prometheus：http://localhost:9090
+- Grafana：http://localhost:3000
+- Metrics：http://localhost:8001/metrics
+
+如果你想快速打出监控数据，可以执行：
+
+```bash
+bash scripts/generate_monitoring_traffic.sh
+```
+
+Grafana 会自动加载预置看板：
+
+- `Document Edit Observability`
 
 ## 常见问题
 
@@ -649,6 +795,24 @@ A:
 3. 运行 `python3 scripts/create_admin_user.py` 创建管理员
 4. 支持 JWT Token 和 API Key 两种认证方式
 
+### Q: 记忆体现在是怎么工作的？
+
+A:
+- **工作记忆**：当前会话上下文，保存在 Redis / 本地缓存
+- **情景记忆**：历史编辑片段，保存在 `user_memory_items`，属于 `episodic memory`
+- **长期偏好**：用户和文档偏好，保存在结构化表，属于 `persona / relation memory`
+- 工作流开始前会自动加载这些信息，并注入 `intent_parser` / `planner`
+
+### Q: 短期记忆会不会无限增长？
+
+A:
+- 不会
+- 情景记忆使用遗忘曲线式 `retention_score` 衰减
+- 记忆稳定性由 `stability` 控制，被重复使用后会更难遗忘
+- 系统会通过后台定时任务自动执行归档维护
+- 也可通过 `/v1/users/me/memory/maintenance` 手动执行一次
+- 当前实现是“遗忘曲线衰减 + 归档”，不是单纯固定 TTL 删除
+
 
 
 ### Q: 协同编辑如何防止冲突？
@@ -689,23 +853,32 @@ A:
 - ✅ LangGraph 工作流重构
 - ✅ 智能体架构（Intent/Router/Retrieval/Edit/Clarify）
 - ✅ 工具层封装（DB/Search/LLM/Index）
+- ✅ Agent + Skill 风格解耦（保留当前 runtime）
 - ⏳ 流式输出支持
 - ⏳ 完整的 Langfuse 追踪
 
-### Phase 4: 前端重构（计划中）
+### Phase 4: 个性化与记忆（进行中）
+- ✅ 真实用户绑定到对话编辑链路
+- ✅ 会话消息落库
+- ✅ 多层记忆体 V1（working / episodic / persona / relation）
+- ✅ 记忆查看与维护接口
+- ✅ 自动定时遗忘曲线维护任务
+- ⏳ 更强的向量化记忆提取与检索
+
+### Phase 5: 前端重构（计划中）
 - 📋 适配新架构的前端界面
 - 📋 实时工作流可视化
 - 📋 智能体执行状态展示
 - 📋 流式响应支持
 
-### Phase 4: 协同编辑（已完成）✅
+### Phase 6: 协同编辑（已完成）✅
 - ✅ 协同编辑（Redis + WebSocket 实时同步）
 - ✅ 多用户实时协作
 - ✅ 编辑锁机制防冲突
 - ✅ 用户状态管理
 - ✅ 光标位置同步
 
-### Phase 5: 高级功能（未来）
+### Phase 7: 高级功能（未来）
 - 📋 AI 主动建议
 - 📋 深度学习重排模型（Cohere Rerank 或自训练）
 - 📋 多语言支持

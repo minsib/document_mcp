@@ -150,12 +150,14 @@ class PreviewGeneratorNode:
         payload = {
             "token_id": token_id,
             "session_id": state["session_id"],
+            "user_id": state["user_id"],
             "doc_id": state["doc_id"],
             "active_rev_id": state["active_rev_id"],
             "active_version": state["active_version"],
             "preview_hash": preview_hash,
             "plan_hash": plan_hash,
             "edit_plan": edit_plan_dict,
+            "workflow_trace": state.get("_workflow_trace", {}),
             "created_at": time.time(),
             "expires_at": time.time() + 900  # 15 分钟
         }
