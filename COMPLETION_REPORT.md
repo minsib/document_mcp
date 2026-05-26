@@ -299,11 +299,8 @@ document_mcp/
 
 ### 测试文件
 
-- ✅ `test_api.py` - API 端点测试
-- ✅ `test_full_workflow.py` - 完整工作流测试
-- ✅ `test_vector_search.py` - 向量检索测试
-- ✅ `test_bulk_edit.py` - 批量修改测试
-- ✅ `test_edit_simple.py` - 简单编辑测试
+- ✅ `tests/test_document_api.py` - 认证、文档上传、导出、版本保存测试
+- ✅ `tests/test_workflow_api.py` - 对话式编辑、批量修改、会话落库、指标链路测试
 
 ### 测试覆盖率
 

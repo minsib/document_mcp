@@ -1,4 +1,4 @@
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
 from app.models.schemas import TargetSelection, TargetBlock, EvidenceQuote, BlockCandidate
 from app.models import database as db_models
@@ -58,7 +58,11 @@ class VerifierNode:
         
         # 如果有多个候选，使用 LLM 选择
         try:
-            selection = self._llm_select(state["intent"], candidates)
+            selection = self._llm_select(
+                state["intent"],
+                candidates,
+                trace_id=state.get("trace_id"),
+            )
             
             # 验证 evidence_quote
             for target in selection.targets:
@@ -80,7 +84,12 @@ class VerifierNode:
             state["error"] = {"code": "verification_failed", "message": str(e)}
             return state
     
-    def _llm_select(self, intent, candidates: List[BlockCandidate]) -> TargetSelection:
+    def _llm_select(
+        self,
+        intent,
+        candidates: List[BlockCandidate],
+        trace_id: Optional[str] = None,
+    ) -> TargetSelection:
         """使用 LLM 选择目标块"""
         # 如果候选很少，直接返回
         if len(candidates) <= 2:
@@ -139,7 +148,12 @@ class VerifierNode:
         ]
         
         try:
-            response = self.llm.chat_completion_json(messages, temperature=0.3)
+            response = self.llm.chat_completion_json(
+                messages,
+                temperature=0.3,
+                trace_id=trace_id,
+                span_name="target_verifier",
+            )
             selection_data = json.loads(response)
             
             return TargetSelection(**selection_data)

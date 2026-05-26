@@ -101,10 +101,10 @@ python scripts/regenerate_embeddings.py <doc_id>
 - 进度显示
 
 #### c. 测试脚本
-**文件**: `test_vector_search.py`
+**文件**: `tests/test_workflow_api.py`
 
 ```bash
-python test_vector_search.py
+pytest -q tests/test_workflow_api.py
 ```
 
 功能：
@@ -226,7 +226,7 @@ psql -h localhost -p 5435 -U postgres -d document_edit -c "SELECT COUNT(*) FROM 
 ### 4. 测试
 
 ```bash
-python test_vector_search.py
+pytest -q tests/test_workflow_api.py
 ```
 
 ## 📈 完成度更新
@@ -295,7 +295,7 @@ python test_vector_search.py
 
 3. 🟡 **测试验证**
    ```bash
-   python test_vector_search.py
+   pytest -q tests/test_workflow_api.py
    ```
 
 ### 短期优化（1-2 周）

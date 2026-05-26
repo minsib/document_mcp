@@ -65,6 +65,15 @@ groups:
           summary: "High retrieval empty rate"
           description: "RAG empty rate is {{ $value | humanizePercentage }} (threshold: 40%)"
 
+      - alert: HighRetrievalDisambiguationRate
+        expr: sum(rate(retrieval_resolution_total{outcome="disambiguation"}[5m])) / clamp_min(sum(rate(retrieval_resolution_total{outcome=~"auto_selected|user_selected|disambiguation|failed"}[5m])), 1e-9) > 0.35
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High retrieval disambiguation rate"
+          description: "Too many edit requests require manual disambiguation, indicating retrieval accuracy degradation"
+
       - alert: HighWorkflowErrorRate
         expr: sum(rate(workflow_runs_total{status="error"}[5m])) / clamp_min(sum(rate(workflow_runs_total[5m])), 1e-9) > 0.1
         for: 5m
@@ -82,6 +91,15 @@ groups:
         annotations:
           summary: "High workflow latency"
           description: "Workflow P95 latency is {{ $value }}s (threshold: 10s)"
+
+      - alert: WorkflowNodeFailures
+        expr: sum(rate(workflow_node_total{status="failed"}[5m])) by (workflow, node) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Workflow node is failing repeatedly"
+          description: "Workflow node {{ $labels.workflow }}/{{ $labels.node }} has elevated failures"
 
       - alert: HighHttpErrorRate
         expr: sum(rate(errors_total[5m])) > 0.2

@@ -95,7 +95,8 @@ class BulkDiscoverNode:
                     doc_id,
                     rev_id,
                     filters={},
-                    limit=limit
+                    limit=limit,
+                    offset=offset,
                 )
                 
                 if not results:

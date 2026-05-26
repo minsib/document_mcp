@@ -2,6 +2,7 @@ from typing import Dict, Any
 from app.models.schemas import Intent, ScopeHint, Constraints
 from app.services.llm_client import get_qwen_client
 import json
+import re
 
 
 class IntentParserNode:
@@ -85,7 +86,10 @@ class IntentParserNode:
             # 降级：使用简单的规则解析
             intent = self._fallback_parse(user_message)
             state["intent"] = intent
-            state["error"] = {"code": "intent_parse_failed", "message": str(e)}
+            state.setdefault("warnings", []).append({
+                "type": "intent_parse_fallback",
+                "message": str(e),
+            })
             return state
     
     def _fallback_parse(self, message: str) -> Intent:
@@ -93,7 +97,12 @@ class IntentParserNode:
         message_lower = message.lower()
         
         # 判断操作类型
-        if "删除" in message or "去掉" in message:
+        if any(token in message for token in ["所有", "全部", "统一", "批量"]) and any(
+            token in message for token in ["替换", "改成", "改为", "替换为"]
+        ):
+            operation = "multi_replace"
+            risk = "medium"
+        elif "删除" in message or "去掉" in message:
             operation = "delete"
             risk = "high"
         elif "增加" in message or "添加" in message or "插入" in message:
@@ -109,10 +118,37 @@ class IntentParserNode:
             if len(word) > 1 and word not in ["把", "将", "的", "了", "在", "和"]:
                 keywords.append(word)
         
+        match_type = None
+        apply_scope = None
+        scope_filter = None
+        quoted_terms = re.findall(r'[“"「](.*?)[”"」]', message)
+        if operation == "multi_replace":
+            match_type = "exact_term"
+            apply_scope = "all_matches"
+            old_term = None
+            new_term = None
+            replace_patterns = [
+                r"(?:将|把)?所有[“\"「](.+?)[”\"」](?:统一)?(?:替换为|改成|改为)[“\"「](.+?)[”\"」]",
+                r"(?:将|把)[“\"「](.+?)[”\"」](?:统一)?(?:替换为|改成|改为)[“\"「](.+?)[”\"」]",
+            ]
+            for pattern in replace_patterns:
+                matched = re.search(pattern, message)
+                if matched:
+                    old_term = matched.group(1).strip()
+                    new_term = matched.group(2).strip()
+                    break
+            if not old_term and len(quoted_terms) >= 2:
+                old_term, new_term = quoted_terms[0], quoted_terms[1]
+            if old_term and new_term:
+                scope_filter = {"term": old_term, "replacement": new_term}
+
         return Intent(
             operation=operation,
             scope_hint=ScopeHint(keywords=keywords[:5]),
             constraints=Constraints(),
             risk=risk,
+            match_type=match_type,
+            apply_scope=apply_scope,
+            scope_filter=scope_filter,
             user_message=message  # 保存原始消息
         )

@@ -34,7 +34,11 @@ class IntentClarifierNode:
             return state
         
         # 2. 检测模糊表达
-        ambiguity_check = self._check_ambiguity(user_message, intent)
+        ambiguity_check = self._check_ambiguity(
+            user_message,
+            intent,
+            trace_id=state.get("trace_id"),
+        )
         if ambiguity_check:
             state["needs_clarification"] = True
             state["clarification"] = ambiguity_check
@@ -109,7 +113,7 @@ class IntentClarifierNode:
             "severity": "high"
         }
     
-    def _check_ambiguity(self, user_message: str, intent: Intent) -> Optional[Dict]:
+    def _check_ambiguity(self, user_message: str, intent: Intent, trace_id: Optional[str] = None) -> Optional[Dict]:
         """检测模糊表达"""
         
         # 先检查是否是明确的字面表达
@@ -154,7 +158,12 @@ class IntentClarifierNode:
         ]
         
         try:
-            response = self.llm.chat_completion_json(messages, temperature=0.3)
+            response = self.llm.chat_completion_json(
+                messages,
+                temperature=0.3,
+                trace_id=trace_id,
+                span_name="intent_clarifier",
+            )
             result = json.loads(response)
             
             if result.get("is_ambiguous"):
@@ -180,12 +189,7 @@ class IntentClarifierNode:
         
         # 检测是否是批量操作
         if operation == "multi_replace":
-            return {
-                "type": "large_scope",
-                "message": "这是一个批量修改操作",
-                "question": "此操作可能影响多个段落，确认继续？",
-                "severity": "medium"
-            }
+            return None
         
         # 检测是否是删除操作
         if operation == "delete":

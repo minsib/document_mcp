@@ -221,7 +221,7 @@ class MeilisearchIndexer:
     def delete_document_index(self, doc_id: str):
         """删除文档的所有索引"""
         index = self.client.get_index(self.index_name)
-        index.delete_documents({'filter': f'doc_id = {doc_id}'})
+        index.delete_documents(filter=f'doc_id = "{doc_id}"')
     
     def search(
         self,
@@ -229,16 +229,17 @@ class MeilisearchIndexer:
         doc_id: str,
         rev_id: str,
         filters: dict = None,
-        limit: int = 20
+        limit: int = 20,
+        offset: int = 0,
     ) -> List[dict]:
         """搜索"""
         index = self.client.get_index(self.index_name)
         
         # 构建过滤器
-        filter_str = f'doc_id = {doc_id} AND rev_id = {rev_id}'
+        filter_str = f'doc_id = "{doc_id}" AND rev_id = "{rev_id}"'
         if filters:
             if filters.get('block_type'):
-                filter_str += f' AND block_type = {filters["block_type"]}'
+                filter_str += f' AND block_type = "{filters["block_type"]}"'
             if filters.get('heading_level'):
                 filter_str += f' AND heading_level = {filters["heading_level"]}'
         
@@ -248,6 +249,7 @@ class MeilisearchIndexer:
             {
                 'filter': filter_str,
                 'limit': limit,
+                'offset': offset,
                 'attributesToRetrieve': ['*']
             }
         )

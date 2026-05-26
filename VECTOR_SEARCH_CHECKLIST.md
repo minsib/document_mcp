@@ -91,7 +91,7 @@ psql -h localhost -p 5435 -U postgres -d document_edit -c "SELECT COUNT(*) as em
 #### 4. 测试向量检索
 
 ```bash
-python test_vector_search.py
+pytest -q tests/test_workflow_api.py
 ```
 
 **预期输出**:

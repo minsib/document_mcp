@@ -120,7 +120,7 @@ python scripts/regenerate_embeddings.py <doc_id>
 
 ### 7. 测试脚本
 
-**文件**: `test_vector_search.py`
+**文件**: `tests/test_workflow_api.py`
 
 功能：
 - ✅ 上传测试文档
@@ -361,7 +361,7 @@ pytest tests/test_rrf.py
 
 ```bash
 # 端到端测试
-python test_vector_search.py
+pytest -q tests/test_workflow_api.py
 ```
 
 ### 性能测试

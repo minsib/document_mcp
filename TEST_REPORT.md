@@ -256,14 +256,14 @@ request_duration_seconds_count{endpoint="/health/",method="GET",status_code="200
 
 ## 测试脚本
 
-测试使用 `test_full_system.py` 脚本，包含以下测试用例：
+测试现统一使用 `tests/` 目录下的 `pytest` 套件，核心用例包括：
 
 1. `test_health_check()` - 健康检查
 2. `test_authentication()` - 用户认证
 3. `test_document_upload()` - 文档上传
 4. `test_document_export()` - 文档导出
 5. `test_chat_edit()` - 对话式编辑
-6. `test_metrics()` - Prometheus 指标
+6. `test_metrics()` - Prometheus 指标与工作流埋点
 
 ---
 

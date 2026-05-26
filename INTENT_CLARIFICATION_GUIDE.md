@@ -359,7 +359,7 @@ response = self.llm.chat_completion_json(messages, temperature=0.3)
 运行测试脚本：
 
 ```bash
-python test_intent_clarification.py
+pytest -q tests/test_workflow_api.py -k chat_edit
 ```
 
 测试内容包括：

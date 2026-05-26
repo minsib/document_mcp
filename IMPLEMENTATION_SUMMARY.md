@@ -130,9 +130,9 @@ document_mcp/
 │   └── db/                     # 数据库操作
 │       └── connection.py       # 连接管理
 ├── tests/                      # 测试
-│   ├── test_api.py
-│   ├── test_full_workflow.py
-│   └── test_edit_simple.py
+│   ├── conftest.py
+│   ├── test_document_api.py
+│   └── test_workflow_api.py
 ├── docker-compose.yml          # Docker 编排
 ├── requirements.txt            # Python 依赖
 └── README.md                   # 项目文档

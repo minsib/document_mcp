@@ -108,6 +108,39 @@ class UploadDocumentResponse(BaseModel):
     title: str
 
 
+class DocumentListItemResponse(BaseModel):
+    doc_id: str
+    title: str
+    source_filename: Optional[str] = None
+    source_format: Optional[str] = None
+    total_blocks: int
+    total_chars: int
+    active_rev_id: Optional[str] = None
+    active_version: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ListDocumentsResponse(BaseModel):
+    documents: List[DocumentListItemResponse]
+    total: int
+
+
+class UpdateDocumentContentRequest(BaseModel):
+    content: str
+    change_summary: Optional[str] = None
+
+
+class UpdateDocumentContentResponse(BaseModel):
+    doc_id: str
+    rev_id: str
+    rev_no: int
+    version: int
+    block_count: int
+    title: str
+    message: str
+
+
 class ChatEditRequest(BaseModel):
     doc_id: str
     session_id: Optional[str] = None

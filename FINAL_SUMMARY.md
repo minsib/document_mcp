@@ -61,7 +61,7 @@
 - `alembic/versions/002_add_vector_column.py`
 - `scripts/add_vector_support.py`
 - `scripts/regenerate_embeddings.py`
-- `test_vector_search.py`
+- `tests/test_workflow_api.py`
 - `VECTOR_SEARCH_SETUP.md`
 - `VECTOR_SEARCH_IMPLEMENTATION.md`
 - `VECTOR_SEARCH_CHECKLIST.md`
@@ -88,7 +88,7 @@
 - `app/nodes/bulk_discover.py`
 - `app/nodes/bulk_preview.py`
 - `app/nodes/bulk_apply.py`
-- `test_bulk_edit.py`
+- `tests/test_workflow_api.py`
 - `BULK_EDIT_GUIDE.md`
 
 ### 3. 用户认证系统 ✅

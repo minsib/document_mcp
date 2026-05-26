@@ -21,8 +21,19 @@ class EditPlannerNode:
     def __call__(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """生成编辑计划"""
         memory_context = state.get("memory_context", "")
-        # 兼容新的工作流状态结构
         selected_target = state.get("selected_target")
+        selection = state.get("selection")
+        if not selected_target and selection is not None:
+            targets = getattr(selection, "targets", None) or []
+            if targets:
+                primary = targets[0]
+                selected_target = {
+                    "block_id": primary.block_id,
+                    "evidence": primary.evidence.model_dump(),
+                    "confidence": primary.confidence,
+                }
+                state["selected_target"] = selected_target
+
         if not selected_target:
             state["errors"] = state.get("errors", []) + [{"type": "no_target", "message": "未选择目标块"}]
             return state
@@ -31,7 +42,10 @@ class EditPlannerNode:
         operations = []
         
         # 将 selected_target 转换为 target 列表
-        targets = [selected_target] if isinstance(selected_target, dict) else []
+        if isinstance(selected_target, dict):
+            targets = [selected_target]
+        else:
+            targets = [selected_target]
         
         for target in targets:
             # 从 target 字典中提取 block_id
@@ -44,7 +58,13 @@ class EditPlannerNode:
             
             try:
                 # 使用 LLM 生成编辑操作
-                operation = self._generate_operation(intent_dict, target, block)
+                operation = self._generate_operation(
+                    intent_dict,
+                    target,
+                    block,
+                    memory_context=memory_context,
+                    trace_id=state.get("trace_id"),
+                )
                 operations.append(operation)
             except Exception as e:
                 fallback_operation = self._build_direct_replace_operation(
@@ -73,7 +93,15 @@ class EditPlannerNode:
         state["edit_plan"] = edit_plan.model_dump()  # 转换为字典
         return state
     
-    def _generate_operation(self, intent_dict, target, block: db_models.BlockVersion) -> EditOperation:
+    def _generate_operation(
+        self,
+        intent_dict,
+        target,
+        block: db_models.BlockVersion,
+        *,
+        memory_context: str = "",
+        trace_id: Optional[str] = None,
+    ) -> EditOperation:
         """生成单个编辑操作"""
         # 从 target 字典中提取信息
         if isinstance(target, dict):
@@ -173,7 +201,12 @@ evidence_quote：{evidence.text}
             {"role": "user", "content": user_content + "\n请生成修改后的内容。输出 JSON："}
         ]
 
-        response = self.llm.chat_completion_json(messages, temperature=0.7)
+        response = self.llm.chat_completion_json(
+            messages,
+            temperature=0.7,
+            trace_id=trace_id,
+            span_name="edit_planner",
+        )
         result = json.loads(response)
         
         # 提取操作类型

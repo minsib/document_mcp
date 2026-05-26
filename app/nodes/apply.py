@@ -45,14 +45,7 @@ class ApplyEditsNode:
             for op_dict in operations:
                 self._validate_operation(current_blocks, op_dict)
             
-            # 3. 执行变更
-            new_blocks, changed_block_ids = self._apply_operations(
-                current_blocks,
-                operations,
-                doc_id
-            )
-            
-            # 4. 创建新 revision
+            # 3. 创建新 revision
             new_rev_no = self._get_next_rev_no(doc_id)
             new_rev = db_models.DocumentRevision(
                 rev_id=uuid.uuid4(),
@@ -64,6 +57,14 @@ class ApplyEditsNode:
             )
             self.db.add(new_rev)
             self.db.flush()
+            
+            # 4. 执行变更
+            new_blocks, changed_block_ids = self._apply_operations(
+                current_blocks,
+                operations,
+                doc_id,
+                new_rev.rev_id,
+            )
             
             # 5. 插入新 block_versions
             for block in new_blocks:
@@ -112,6 +113,15 @@ class ApplyEditsNode:
             new_version = updated[0]
             
             self.db.commit()
+
+            try:
+                from app.services.cache import get_cache_manager
+
+                cache_manager = get_cache_manager()
+                cache_manager.invalidate_document(str(doc_id))
+                cache_manager.invalidate_revision(str(active_rev_id))
+            except Exception:
+                pass
             
             # 8. 更新 Meilisearch 索引
             try:
@@ -142,7 +152,11 @@ class ApplyEditsNode:
         except IntegrityError as e:
             self.db.rollback()
             state["errors"] = state.get("errors", []) + [{"type": "concurrent_edit", "message": "文档已被他人修改"}]
-            state["retry_count"] = state.get("retry_count", 0) + 1
+            return state
+
+        except ValueError as e:
+            self.db.rollback()
+            state["errors"] = state.get("errors", []) + [{"type": "validation_failed", "message": str(e)}]
             return state
             
         except Exception as e:
@@ -175,7 +189,8 @@ class ApplyEditsNode:
         self,
         current_blocks: List[db_models.BlockVersion],
         operations,
-        doc_id: uuid.UUID
+        doc_id: uuid.UUID,
+        new_rev_id: uuid.UUID,
     ) -> Tuple[List[db_models.BlockVersion], Set[uuid.UUID]]:
         """应用操作"""
         new_blocks = []
@@ -225,10 +240,11 @@ class ApplyEditsNode:
                     self.db.execute(
                         text("""
                         UPDATE blocks
-                        SET deleted_at = now()
+                        SET deleted_at = now(),
+                            deleted_in_rev_id = :rev_id
                         WHERE block_id = :block_id
                         """),
-                        {"block_id": block.block_id}
+                        {"block_id": block.block_id, "rev_id": new_rev_id}
                     )
                     # 不添加到 new_blocks
                     continue
@@ -237,13 +253,13 @@ class ApplyEditsNode:
                     # 先添加原块
                     new_blocks.append(self._copy_block(block))
                     # 创建新块
-                    new_block = self._create_new_block(op, doc_id, block)
+                    new_block = self._create_new_block(op, doc_id, block, new_rev_id)
                     new_blocks.append(new_block)
                     changed_block_ids.add(new_block.block_id)
                 
                 elif op_type == "insert_before":
                     # 先添加新块
-                    new_block = self._create_new_block(op, doc_id, block)
+                    new_block = self._create_new_block(op, doc_id, block, new_rev_id)
                     new_blocks.append(new_block)
                     changed_block_ids.add(new_block.block_id)
                     # 再添加原块
@@ -274,7 +290,13 @@ class ApplyEditsNode:
             parent_version_id=None
         )
     
-    def _create_new_block(self, op, doc_id: uuid.UUID, context_block: db_models.BlockVersion) -> db_models.BlockVersion:
+    def _create_new_block(
+        self,
+        op,
+        doc_id: uuid.UUID,
+        context_block: db_models.BlockVersion,
+        new_rev_id: uuid.UUID,
+    ) -> db_models.BlockVersion:
         """创建新块"""
         new_block_id = uuid.uuid4()
         
@@ -288,7 +310,7 @@ class ApplyEditsNode:
         block = db_models.Block(
             block_id=new_block_id,
             doc_id=doc_id,
-            first_rev_id=None  # 稍后设置
+            first_rev_id=new_rev_id,
         )
         self.db.add(block)
         self.db.flush()

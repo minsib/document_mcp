@@ -1,8 +1,16 @@
 """
 批量预览节点 - 生成批量修改的预览
 """
-from typing import List, Dict
-from app.models.schemas import Intent, BlockCandidate, PreviewDiff, DiffItem
+from typing import List
+from app.models.schemas import (
+    Intent,
+    BlockCandidate,
+    PreviewDiff,
+    DiffItem,
+    EditPlan,
+    EditOperation,
+    EvidenceQuote,
+)
 from app.models import database as db_models
 from app.utils.markdown import strip_markdown
 from app.utils.intent_helper import get_intent_attr
@@ -20,8 +28,9 @@ class BulkPreviewNode:
         self,
         intent: Intent,
         candidates: List[BlockCandidate],
-        rev_id: str
-    ) -> PreviewDiff:
+        rev_id: str,
+        doc_id: str = ""
+    ) -> tuple[PreviewDiff, EditPlan]:
         """
         生成批量修改预览
         
@@ -47,6 +56,7 @@ class BulkPreviewNode:
         
         # 生成每个块的 diff
         diffs = []
+        operations = []
         grouped_by_heading = {}
         total_chars_added = 0
         total_chars_removed = 0
@@ -73,6 +83,21 @@ class BulkPreviewNode:
             # 创建 diff item
             before_snippet = block.plain_text[:200] if block.plain_text else ''
             after_snippet = strip_markdown(new_content)[:200]
+
+            evidence_text = block.plain_text[: min(len(block.plain_text or ""), 80)] if block.plain_text else ""
+            evidence = EvidenceQuote(
+                text=evidence_text,
+                start=0,
+                end=len(evidence_text),
+            )
+
+            operations.append(EditOperation(
+                op_type="replace",
+                target_block_id=str(block.block_id),
+                evidence=evidence,
+                new_content_md=new_content,
+                rationale="批量替换命中内容",
+            ))
             
             diffs.append(DiffItem(
                 block_id=str(block.block_id),
@@ -90,7 +115,7 @@ class BulkPreviewNode:
         # 评估影响等级
         estimated_impact = self._estimate_impact(len(diffs))
         
-        return PreviewDiff(
+        preview = PreviewDiff(
             diffs=diffs,
             total_changes=len(diffs),
             estimated_impact=estimated_impact,
@@ -98,6 +123,15 @@ class BulkPreviewNode:
             total_chars_added=total_chars_added,
             total_chars_removed=total_chars_removed
         )
+
+        edit_plan = EditPlan(
+            doc_id=doc_id,
+            rev_id=rev_id,
+            operations=operations,
+            estimated_impact="high" if len(diffs) > 20 else "medium",
+            requires_confirmation=True,
+        )
+        return preview, edit_plan
     
     def _generate_replacement(
         self,
@@ -141,7 +175,12 @@ class BulkPreviewNode:
                     print(f"正则表达式错误: {e}")
                     return content
         
-        # 其他类型需要调用 LLM 生成（暂不实现）
+        # 语义批量替换：当前降级为基于 replacement 指令的直接替换，不做跨主题改写
+        replacement = scope_filter.get("replacement", "") if scope_filter else ""
+        term = scope_filter.get("term", "") if scope_filter else ""
+        if replacement and term:
+            return content.replace(term, replacement)
+
         return content
     
     def _estimate_impact(self, change_count: int) -> str:

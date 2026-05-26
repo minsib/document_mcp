@@ -1,10 +1,11 @@
 """
 Prometheus 指标收集
 """
+from contextlib import contextmanager
 from prometheus_client import Counter, Histogram, Gauge, Info
 import time
 from functools import wraps
-from typing import Callable
+from typing import Callable, Iterator, Optional
 
 # ============ 业务指标 ============
 
@@ -88,6 +89,39 @@ retrieval_requests = Counter(
     'retrieval_requests_total',
     'Total number of retrieval requests',
     ['mode', 'status']  # success, empty, error
+)
+
+retrieval_resolution_total = Counter(
+    'retrieval_resolution_total',
+    'Retrieval resolution outcomes for edit requests',
+    ['outcome']  # auto_selected, disambiguation, retry, no_candidates, failed
+)
+
+retrieval_selected_confidence = Histogram(
+    'retrieval_selected_confidence',
+    'Confidence of selected retrieval targets',
+    ['selection_source'],
+    buckets=[0.0, 0.3, 0.5, 0.7, 0.85, 0.95, 1.0]
+)
+
+retrieval_candidate_count = Histogram(
+    'retrieval_candidate_count',
+    'Number of retrieval candidates produced per request',
+    ['mode'],
+    buckets=[0, 1, 3, 5, 10, 20, 50]
+)
+
+retrieval_top_score = Histogram(
+    'retrieval_top_score',
+    'Top retrieval score per request',
+    ['mode'],
+    buckets=[0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
+)
+
+retrieval_evidence_validation_total = Counter(
+    'retrieval_evidence_validation_total',
+    'Evidence validation results during target selection',
+    ['result']  # matched, mismatched
 )
 
 # 认证操作
@@ -188,6 +222,31 @@ workflow_runs_total = Counter(
     'workflow_runs_total',
     'Total number of workflow runs',
     ['workflow', 'status']  # success, error
+)
+
+workflow_node_duration = Histogram(
+    'workflow_node_duration_seconds',
+    'Workflow node execution duration in seconds',
+    ['workflow', 'node', 'status'],
+    buckets=[0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+)
+
+workflow_node_total = Counter(
+    'workflow_node_total',
+    'Total number of workflow node executions',
+    ['workflow', 'node', 'status']  # started, completed, failed
+)
+
+workflow_route_total = Counter(
+    'workflow_route_total',
+    'Total number of workflow route transitions',
+    ['workflow', 'route']
+)
+
+workflow_active_runs = Gauge(
+    'workflow_active_runs',
+    'Number of currently executing workflow runs',
+    ['workflow']
 )
 
 # 活跃用户
@@ -294,3 +353,46 @@ def track_llm_call(model: str, operation: str):
             return sync_wrapper
     
     return decorator
+
+
+@contextmanager
+def track_workflow_node_metric(workflow: str, node: str) -> Iterator[None]:
+    """Track workflow node execution time and outcome."""
+    start_time = time.time()
+    workflow_node_total.labels(workflow=workflow, node=node, status="started").inc()
+    status = "completed"
+    try:
+        yield
+    except Exception:
+        status = "failed"
+        workflow_node_total.labels(workflow=workflow, node=node, status=status).inc()
+        raise
+    else:
+        workflow_node_total.labels(workflow=workflow, node=node, status=status).inc()
+    finally:
+        duration = time.time() - start_time
+        workflow_node_duration.labels(workflow=workflow, node=node, status=status).observe(duration)
+
+
+def record_workflow_route(workflow: str, route: str) -> None:
+    workflow_route_total.labels(workflow=workflow, route=route).inc()
+
+
+def record_retrieval_metrics(
+    *,
+    mode: str,
+    candidate_count: int,
+    top_score: Optional[float] = None,
+    selected_confidence: Optional[float] = None,
+    selection_source: Optional[str] = None,
+    outcome: Optional[str] = None,
+) -> None:
+    retrieval_candidate_count.labels(mode=mode).observe(candidate_count)
+    if top_score is not None:
+        retrieval_top_score.labels(mode=mode).observe(max(0.0, min(float(top_score), 1.0)))
+    if selected_confidence is not None and selection_source:
+        retrieval_selected_confidence.labels(selection_source=selection_source).observe(
+            max(0.0, min(float(selected_confidence), 1.0))
+        )
+    if outcome:
+        retrieval_resolution_total.labels(outcome=outcome).inc()

@@ -30,7 +30,7 @@
 - `alembic/versions/002_add_vector_column.py` - 数据库迁移
 - `scripts/add_vector_support.py` - 添加向量支持
 - `scripts/regenerate_embeddings.py` - 重新生成 embeddings
-- `test_vector_search.py` - 测试脚本
+- `tests/test_workflow_api.py` - 工作流与检索链路测试
 - `VECTOR_SEARCH_SETUP.md` - 设置指南
 - `VECTOR_SEARCH_IMPLEMENTATION.md` - 实现总结
 - `VECTOR_SEARCH_CHECKLIST.md` - 启用清单
@@ -69,7 +69,7 @@
 - `app/nodes/bulk_discover.py` - 批量发现
 - `app/nodes/bulk_preview.py` - 批量预览
 - `app/nodes/bulk_apply.py` - 批量应用
-- `test_bulk_edit.py` - 测试脚本
+- `tests/test_workflow_api.py` - 批量修改与确认测试
 - `BULK_EDIT_GUIDE.md` - 使用指南
 
 #### 更新文件
@@ -301,7 +301,7 @@ python3 scripts/add_vector_support.py
 python3 scripts/regenerate_embeddings.py
 
 # 测试
-python3 test_vector_search.py
+pytest -q tests/test_workflow_api.py
 ```
 
 详细说明：[VECTOR_SEARCH_SETUP.md](VECTOR_SEARCH_SETUP.md)
@@ -346,14 +346,8 @@ confirm_response = requests.post(
 ### 3. 测试系统
 
 ```bash
-# 测试向量检索
-python3 test_vector_search.py
-
-# 测试批量修改
-python3 test_bulk_edit.py
-
-# 测试完整工作流
-python3 test_full_workflow.py
+# 运行当前结构化测试
+pytest -q
 ```
 
 ---

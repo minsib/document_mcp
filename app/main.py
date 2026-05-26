@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Security, Form, File, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from prometheus_client import make_asgi_app
 import uuid
@@ -14,7 +15,9 @@ from app.db.schema_sync import ensure_memory_schema
 from app.models.database import Base
 from app.auth.models import User as AuthUser, APIKey
 from app.models.schemas import (
-    UploadDocumentResponse, ChatEditRequest, ChatEditResponse,
+    UploadDocumentResponse, ListDocumentsResponse, DocumentListItemResponse,
+    UpdateDocumentContentRequest, UpdateDocumentContentResponse,
+    ChatEditRequest, ChatEditResponse,
     ConfirmRequest, ConfirmResponse, ChatSessionDetailResponse,
     ChatMessageResponse, UserPreferenceResponse, UserPreferenceUpsertRequest,
     UserMemoryItemResponse
@@ -31,6 +34,7 @@ from app.services.chat_sessions import (
     ensure_chat_session,
     normalize_session_id,
 )
+from app.services.document_converter import convert_docx_to_markdown
 from app.services.memory import MemoryService
 from app.services.memory_scheduler import MemoryMaintenanceScheduler
 
@@ -187,9 +191,142 @@ def _ensure_session_or_409(
         raise HTTPException(409, "session_id 与当前用户或文档不匹配") from exc
 
 
+def _index_document_revision(db: Session, doc_id: str, rev_id: str) -> None:
+    """Refresh the search index for a revision without failing the request."""
+    try:
+        from app.services.search_indexer import get_indexer
+
+        indexer = get_indexer()
+        indexer.delete_document_index(doc_id)
+        indexer.index_document_blocks(doc_id, rev_id, db)
+    except Exception:
+        logger.exception("索引刷新失败 doc_id=%s rev_id=%s", doc_id, rev_id)
+
+
+def _replace_document_content(
+    db: Session,
+    *,
+    document: db_models.Document,
+    markdown: str,
+    created_by: str,
+    change_summary: str,
+) -> tuple[db_models.DocumentRevision, int, int]:
+    """Persist a full-document replacement as a new revision."""
+    active_rev = db.query(db_models.DocumentActiveRevision).filter(
+        db_models.DocumentActiveRevision.doc_id == document.doc_id
+    ).first()
+    if not active_rev:
+        raise HTTPException(404, "文档当前没有可用版本")
+
+    current_revision = db.query(db_models.DocumentRevision).filter(
+        db_models.DocumentRevision.rev_id == active_rev.rev_id
+    ).first()
+
+    splitter = BlockSplitter()
+    blocks = splitter.split_document(markdown)
+    if not blocks:
+        raise HTTPException(400, "文档内容不能为空")
+
+    new_rev_no = (current_revision.rev_no if current_revision else 0) + 1
+    new_version = active_rev.version + 1
+    new_revision = db_models.DocumentRevision(
+        rev_id=uuid.uuid4(),
+        doc_id=document.doc_id,
+        rev_no=new_rev_no,
+        parent_rev_id=active_rev.rev_id,
+        created_by=created_by,
+        change_summary=change_summary,
+    )
+    db.add(new_revision)
+    db.flush()
+
+    for block_data in blocks:
+        block = db_models.Block(
+            block_id=block_data.block_id,
+            doc_id=document.doc_id,
+            first_rev_id=new_revision.rev_id,
+        )
+        db.add(block)
+
+        block_version = db_models.BlockVersion(
+            block_version_id=uuid.uuid4(),
+            block_id=block_data.block_id,
+            rev_id=new_revision.rev_id,
+            order_index=block_data.order_index,
+            block_type=block_data.block_type,
+            heading_level=block_data.heading_level,
+            parent_heading_block_id=block_data.parent_heading_block_id,
+            content_md=block_data.content_md,
+            plain_text=block_data.plain_text,
+            content_hash=block_data.content_hash,
+        )
+        db.add(block_version)
+
+    document.total_blocks = len(blocks)
+    document.total_chars = sum(len(block.content_md) for block in blocks)
+    active_rev.rev_id = new_revision.rev_id
+    active_rev.version = new_version
+
+    db.commit()
+    _index_document_revision(db, str(document.doc_id), str(new_revision.rev_id))
+    return new_revision, new_version, len(blocks)
+
+
+@app.get("/v1/docs", response_model=ListDocumentsResponse)
+async def list_documents(
+    limit: int = 50,
+    offset: int = 0,
+    q: Optional[str] = None,
+    current_user: AuthUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """List the current user's documents for the frontend shell."""
+    query = db.query(db_models.Document).filter(
+        db_models.Document.user_id == current_user.user_id
+    )
+    if q:
+        query = query.filter(db_models.Document.title.ilike(f"%{q}%"))
+
+    total = query.count()
+    documents = query.order_by(db_models.Document.updated_at.desc()).limit(
+        min(limit, 100)
+    ).offset(offset).all()
+
+    doc_ids = [document.doc_id for document in documents]
+    active_revisions = []
+    if doc_ids:
+        active_revisions = db.query(db_models.DocumentActiveRevision).filter(
+            db_models.DocumentActiveRevision.doc_id.in_(doc_ids)
+        ).all()
+    active_map = {active.doc_id: active for active in active_revisions}
+
+    return ListDocumentsResponse(
+        documents=[
+            DocumentListItemResponse(
+                doc_id=str(document.doc_id),
+                title=document.title,
+                source_filename=document.source_filename,
+                source_format=document.source_format,
+                total_blocks=document.total_blocks,
+                total_chars=document.total_chars,
+                active_rev_id=str(active_map[document.doc_id].rev_id)
+                if document.doc_id in active_map
+                else None,
+                active_version=active_map[document.doc_id].version
+                if document.doc_id in active_map
+                else None,
+                created_at=document.created_at,
+                updated_at=document.updated_at,
+            )
+            for document in documents
+        ],
+        total=total,
+    )
+
+
 @app.post("/v1/docs/upload", response_model=UploadDocumentResponse)
 async def upload_document(
-    title: str = Form(...),
+    title: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     content: Optional[str] = Form(None),
     current_user: AuthUser = Depends(get_current_active_user),
@@ -199,14 +336,27 @@ async def upload_document(
     # 使用当前用户的 ID
     user_id = current_user.user_id
     
+    normalized_title = (title or "").strip()
+
     # 获取文档内容
     if file:
-        markdown = (await file.read()).decode('utf-8')
+        raw_bytes = await file.read()
         source_filename = file.filename
-        source_format = file.filename.split('.')[-1] if '.' in file.filename else 'txt'
+        source_format = file.filename.split('.')[-1].lower() if file.filename and '.' in file.filename else 'txt'
+        if not normalized_title:
+            normalized_title = (file.filename or "未命名文档").rsplit(".", 1)[0].strip() or "未命名文档"
+        if source_format in {"md", "markdown", "txt"}:
+            markdown = raw_bytes.decode('utf-8')
+        elif source_format == "docx":
+            markdown = convert_docx_to_markdown(raw_bytes)
+        elif source_format == "pdf":
+            raise HTTPException(400, "暂不支持 PDF 解析，请先上传 Markdown、TXT 或 DOCX")
+        else:
+            raise HTTPException(400, f"不支持的文件格式: {source_format}")
     elif content:
         markdown = content
-        source_filename = f"{title}.md"
+        normalized_title = normalized_title or "未命名文档"
+        source_filename = f"{normalized_title}.md"
         source_format = "md"
     else:
         raise HTTPException(400, "Either file or content must be provided")
@@ -219,7 +369,7 @@ async def upload_document(
     doc = db_models.Document(
         doc_id=uuid.uuid4(),
         user_id=user_id,
-        title=title,
+        title=normalized_title,
         source_filename=source_filename,
         source_format=source_format,
         total_blocks=len(blocks),
@@ -271,13 +421,7 @@ async def upload_document(
     
     db.commit()
     
-    # 索引到 Meilisearch
-    try:
-        from app.services.search_indexer import get_indexer
-        indexer = get_indexer()
-        indexer.index_document_blocks(str(doc.doc_id), str(rev.rev_id), db)
-    except Exception as e:
-        print(f"索引失败（不影响上传）: {e}")
+    _index_document_revision(db, str(doc.doc_id), str(rev.rev_id))
     
     # 记录指标
     from app.monitoring.metrics import documents_uploaded
@@ -287,7 +431,36 @@ async def upload_document(
         doc_id=str(doc.doc_id),
         rev_id=str(rev.rev_id),
         block_count=len(blocks),
-        title=title
+        title=normalized_title
+    )
+
+
+@app.put("/v1/docs/{doc_id}/content", response_model=UpdateDocumentContentResponse)
+async def update_document_content(
+    doc_id: str,
+    request: UpdateDocumentContentRequest,
+    current_user: AuthUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Save editor content as a new full-document revision."""
+    document = _get_owned_document_or_404(db, doc_id, current_user.user_id)
+    change_summary = request.change_summary or "通过编辑器保存整篇文档"
+    new_revision, new_version, block_count = _replace_document_content(
+        db,
+        document=document,
+        markdown=request.content,
+        created_by="editor",
+        change_summary=change_summary,
+    )
+    db.refresh(document)
+    return UpdateDocumentContentResponse(
+        doc_id=str(document.doc_id),
+        rev_id=str(new_revision.rev_id),
+        rev_no=new_revision.rev_no,
+        version=new_version,
+        block_count=block_count,
+        title=document.title,
+        message="文档已保存为新版本",
     )
 
 
@@ -295,9 +468,11 @@ async def upload_document(
 async def export_document(
     doc_id: str,
     rev_id: Optional[str] = None,
+    current_user: AuthUser = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
     """导出文档"""
+    _get_owned_document_or_404(db, doc_id, current_user.user_id)
     doc_uuid = uuid.UUID(doc_id)
     
     # 获取 revision
@@ -641,14 +816,16 @@ async def confirm_edit(
     
     if result.get("apply_result"):
         edits_applied.labels(operation_type=operation_type).inc()
+        apply_result = result["apply_result"]
+        new_rev_id = apply_result["new_rev_id"] if isinstance(apply_result, dict) else apply_result.new_rev_id
         # 导出文档
         from app.services.workflow import EditWorkflow
         workflow = EditWorkflow(db, cache)
-        export_md = workflow._export_document(result["apply_result"].new_rev_id)
+        export_md = workflow._export_document(new_rev_id)
         response = ConfirmResponse(
             status="applied",
             session_id=session_id,
-            new_rev_id=result["apply_result"].new_rev_id,
+            new_rev_id=new_rev_id,
             export_md=export_md,
             message="修改已应用"
         )
@@ -769,11 +946,13 @@ async def list_revisions(
     doc_id: str,
     limit: int = 20,
     offset: int = 0,
+    current_user: AuthUser = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
     """列出文档版本"""
     from app.models.schemas import RevisionResponse, ListRevisionsResponse
     
+    _get_owned_document_or_404(db, doc_id, current_user.user_id)
     doc_uuid = uuid.UUID(doc_id)
     
     # 获取 active_revision
@@ -813,11 +992,13 @@ async def list_revisions(
 async def rollback_revision(
     doc_id: str,
     request: dict,
+    current_user: AuthUser = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
     """回滚到指定版本"""
     from app.models.schemas import RollbackResponse
     
+    _get_owned_document_or_404(db, doc_id, current_user.user_id)
     doc_uuid = uuid.UUID(doc_id)
     target_rev_id = uuid.UUID(request["target_rev_id"])
     
@@ -909,6 +1090,7 @@ async def bulk_edit(
     """
     from app.nodes.bulk_discover import BulkDiscoverNode
     from app.nodes.bulk_preview import BulkPreviewNode
+    from app.nodes.preview import PreviewGeneratorNode
     from app.models.schemas import Intent, ScopeHint
     
     # 解析请求
@@ -971,10 +1153,11 @@ async def bulk_edit(
         
         # 2. 生成预览
         preview_node = BulkPreviewNode(db)
-        preview = preview_node.generate_preview(
+        preview, edit_plan = preview_node.generate_preview(
             intent,
             candidates,
-            str(active_rev.rev_id)
+            str(active_rev.rev_id),
+            doc_id,
         )
         
         if not preview.diffs:
@@ -983,43 +1166,25 @@ async def bulk_edit(
                 "message": "没有需要修改的内容",
                 "preview": preview.model_dump()
             }
-        
-        # 3. 生成 confirm_token
-        from app.services.cache import get_cache_manager
-        import hashlib
-        import json
-        import time
-        
-        cache = get_cache_manager()
-        token_id = str(uuid.uuid4())
-        
-        # 计算 preview_hash
-        preview_json = json.dumps(preview.model_dump(), sort_keys=True)
-        preview_hash = hashlib.sha256(preview_json.encode()).hexdigest()
-        
-        payload = {
-            "token_id": token_id,
+
+        state = {
+            "doc_id": doc_id,
             "session_id": session_id,
             "user_id": str(current_user.user_id),
-            "doc_id": doc_id,
             "active_rev_id": str(active_rev.rev_id),
             "active_version": active_rev.version,
-            "preview_hash": preview_hash,
-            "preview": preview.model_dump(),
-            "intent": intent.model_dump(),
-            "created_at": time.time(),
-            "expires_at": time.time() + 900  # 15 分钟
+            "edit_plan": edit_plan.model_dump(),
+            "_workflow_trace": {"nodes_used": ["bulk_discover", "bulk_preview"], "routes": [], "events": []},
         }
-        
-        cache.store_confirm_token(session_id, token_id, payload, ttl=900)
-        
+        state = PreviewGeneratorNode(db)(state)
+
         return {
             "status": "need_confirm",
             "message": f"将修改 {preview.total_changes} 处内容，请确认",
             "session_id": session_id,
-            "preview": preview.model_dump(),
-            "confirm_token": token_id,
-            "preview_hash": preview_hash,
+            "preview": state["preview_diff"],
+            "confirm_token": state["confirm_token"],
+            "preview_hash": state["preview_hash"],
             "grouped_by_heading": preview.grouped_by_heading
         }
         
@@ -1047,103 +1212,19 @@ async def bulk_confirm(
         "action": "apply" | "cancel"
     }
     """
-    from app.nodes.bulk_apply import BulkApplyNode
-    from app.services.cache import get_cache_manager
-    from app.models.schemas import PreviewDiff
-    import hashlib
-    import json
-    
-    session_id = request.get("session_id")
-    doc_id = request.get("doc_id")
-    confirm_token = request.get("confirm_token")
-    preview_hash = request.get("preview_hash")
-    action = request.get("action", "apply")
-    
-    if not all([session_id, doc_id, confirm_token, preview_hash]):
-        raise HTTPException(400, "缺少必需参数")
-
-    _get_owned_document_or_404(db, doc_id, current_user.user_id)
-    session_id = normalize_session_id(
-        session_id,
-        user_id=str(current_user.user_id),
-        doc_id=doc_id,
+    confirm_request = ConfirmRequest(
+        session_id=request.get("session_id"),
+        doc_id=request.get("doc_id"),
+        confirm_token=request.get("confirm_token"),
+        action=request.get("action", "apply"),
+        preview_hash=request.get("preview_hash"),
     )
-    
-    # 获取 token payload
-    cache = get_cache_manager()
-    payload = cache.get_confirm_token(session_id, confirm_token)
-    
-    if not payload:
-        raise HTTPException(400, "确认令牌无效或已过期")
 
-    if payload.get("user_id") != str(current_user.user_id):
-        cache.delete_confirm_token(session_id, confirm_token)
-        raise HTTPException(403, "确认令牌不属于当前用户")
-    
-    # 验证 preview_hash
-    if preview_hash != payload.get("preview_hash"):
-        cache.delete_confirm_token(session_id, confirm_token)
-        raise HTTPException(400, "预览内容已变更，请重新确认")
-    
-    # 取消操作
-    if action == "cancel":
-        cache.delete_confirm_token(session_id, confirm_token)
-        return {
-            "status": "cancelled",
-            "message": "已取消批量修改"
-        }
-    
-    # 获取当前活跃版本
-    doc_uuid = uuid.UUID(doc_id)
-    active_rev = db.query(db_models.DocumentActiveRevision).filter(
-        db_models.DocumentActiveRevision.doc_id == doc_uuid
-    ).first()
-    
-    if not active_rev:
-        raise HTTPException(404, "文档不存在")
-    
-    # 验证版本号
-    if active_rev.version != payload.get("active_version"):
-        cache.delete_confirm_token(session_id, confirm_token)
-        raise HTTPException(409, "文档版本已变更，预览已失效")
-    
-    try:
-        # 应用批量修改
-        apply_node = BulkApplyNode(db)
-        preview = PreviewDiff(**payload["preview"])
-        
-        result = apply_node.apply_bulk_changes(
-            preview,
-            doc_id,
-            str(active_rev.rev_id),
-            active_rev.version,
-            user_id=str(current_user.user_id),
-            trace_id=None
-        )
-        
-        # 删除 token
-        cache.delete_confirm_token(session_id, confirm_token)
-        
-        # 重新索引（如果启用了 Meilisearch）
-        try:
-            from app.services.search_indexer import get_indexer
-            indexer = get_indexer()
-            indexer.index_document_blocks(doc_id, result['new_rev_id'], db)
-        except Exception as e:
-            print(f"重新索引失败（不影响主流程）: {e}")
-        
-        return {
-            "status": "applied",
-            "message": f"已成功修改 {result['changes_applied']} 处内容",
-            "new_rev_id": result['new_rev_id'],
-            "new_rev_no": result['new_rev_no'],
-            "new_version": result['new_version'],
-            "changes_applied": result['changes_applied']
-        }
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, f"应用批量修改失败: {str(e)}")
+    return await confirm_edit(
+        request=confirm_request,
+        current_user=current_user,
+        db=db,
+    )
 
 
 @app.get("/v1/chat/sessions/{session_id}", response_model=ChatSessionDetailResponse)

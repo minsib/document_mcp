@@ -188,9 +188,8 @@ Qwen3 API：已集成并测试通过
 - ✅ 设计文档_最终版.md - 完整的系统设计
 - ✅ .env.example - 环境变量示例
 - ✅ PROJECT_STATUS.md - 本文件
-- ✅ test_api.py - 基础 API 测试
-- ✅ test_full_workflow.py - 完整工作流测试
-- ✅ test_edit_simple.py - 简单编辑测试
+- ✅ tests/test_document_api.py - 基础文档与认证测试
+- ✅ tests/test_workflow_api.py - 完整工作流与会话测试
 
 ## 🔗 相关链接
 

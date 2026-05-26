@@ -448,7 +448,7 @@ rollback_to_revision(doc_id, current_rev)
 运行测试脚本：
 
 ```bash
-python test_bulk_edit.py
+pytest -q tests/test_workflow_api.py -k bulk_edit
 ```
 
 测试内容：
@@ -485,4 +485,4 @@ A: 会。应用修改后会自动重新生成受影响块的 embeddings。
 
 - [API 文档](README.md)
 - [版本管理](README.md#版本管理)
-- [测试脚本](test_bulk_edit.py)
+- [测试套件](tests/test_workflow_api.py)
